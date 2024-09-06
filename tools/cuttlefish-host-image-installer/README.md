@@ -22,7 +22,7 @@ The latest image are always put into https://artifacts.codelinaro.org/ui/native/
    * The source can be downloaded by kernel_download.sh
    * kernel_dependencies.sh install the build dependencies that is needed
      by kernel_build_deb.sh
- * addpreseed.sh:
+ * addpreseed.sh, addpreseed_aosp.sh:
    * To run this script. Users have to downmiad mini.iso first.
      https://deb.debian.org/debian/dists/bookworm/main/installer-arm64/current/images/netboot/mini.iso
    * This script will add preseed to the mini.iso to make it a live
@@ -34,6 +34,7 @@ We put the preseed file in preseed subdirectory.
 
  * preseed/preseed.cfg: the preseed file.
  * preseed/after_install_1.sh: the post-install script.
+ * preseed/after_install_1_aosp.sh: the post-install script using aosp kernel. 
 
 ## Metapackage Customization
 

@@ -42,6 +42,27 @@ jobs:
         name: preseed-mini
         path: tools/cuttlefish-host-image-installer/preseed-mini.iso.xz
 
+  build-installer-aosp-iso-job:
+    runs-on: ubuntu-latest
+    container:
+      image: debian@sha256:c2cedd7f80a4dd0f9f80d3699bd433ccf3de33ab63bfa2d4c4ba870c998222d6 # debian:bookworm-20240311
+    env:
+      DEBIAN_ISO_URL: https://deb.debian.org/debian/dists/bookworm/main/installer-arm64/current/images/netboot/mini.iso
+    steps:
+    - name: checkout repository
+      uses: actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675 # aka v2
+    - name: Prepare building environment
+      run: apt-get update && apt-get upgrade -y && apt-get install -y sudo wget libarchive-tools xorriso cpio xz-utils fdisk
+    - name: Inject name and ID into preseed 
+      run: echo "CI_PROJECT_NAME=${{ github.event.repository.name }}" >> tools/cuttlefish-host-image-installer/preseed/after_install_1_aosp.sh && echo "CI_PIPELINE_ID=${{ github.repository}}/${{ github.workflow }}" >> tools/cuttlefish-host-image-installer/preseed//after_install_1_aosp.sh
+    - name: Download Debian installer
+      run: cd tools/cuttlefish-host-image-installer && wget -nv -c ${DEBIAN_ISO_URL} && ./addpreseed_aosp.sh && xz -9e preseed-mini_aosp.iso
+    - name: Publish preseed-mini_aosp.iso.xz
+      uses: actions/upload-artifact@c7d193f32edcb7bfad88892161225aeda64e9392 # aka v4.0.0
+      with:
+        name: preseed-mini_aosp
+        path: tools/cuttlefish-host-image-installer/preseed-mini_aosp.iso.xz        
+        
   build-cuttlefish-deb-job:
     uses: ./.github/workflows/reusable-build.yaml
 
