@@ -16,8 +16,6 @@
 
 #include "host/commands/cvd/server_command/acloud_translator.h"
 
-#include <mutex>
-
 #include "common/libs/fs/shared_buf.h"
 #include "common/libs/utils/flag_parser.h"
 #include "common/libs/utils/result.h"
@@ -56,7 +54,14 @@ class AcloudTranslatorCommand : public CvdServerHandler {
     return false;
   }
 
+  // not intended to be used by the user
   cvd_common::Args CmdList() const override { return {}; }
+  // not intended to show up in help
+  Result<std::string> SummaryHelp() const override { return ""; }
+  bool ShouldInterceptHelp() const override { return false; }
+  Result<std::string> DetailedHelp(std::vector<std::string>&) const override {
+    return "";
+  }
 
   Result<cvd::Response> Handle(const RequestWithStdio& request) override {
     CF_EXPECT(CanHandle(request));
@@ -80,7 +85,7 @@ class AcloudTranslatorCommand : public CvdServerHandler {
     CF_EXPECT(ConsumeFlags(translator_flags, invocation.arguments),
               "Failed to process translator flag.");
     if (help) {
-      WriteAll(request.Out(), kTranslatorHelpMessage);
+      request.Out() << kTranslatorHelpMessage;
       return response;
     }
     CF_EXPECT(flag_optout != flag_optin,

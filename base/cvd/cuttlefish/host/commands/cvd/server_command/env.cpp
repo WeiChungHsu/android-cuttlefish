@@ -18,20 +18,13 @@
 
 #include <android-base/strings.h>
 
-#include <iostream>
-#include <mutex>
-#include <optional>
-#include <sstream>
 #include <string>
 #include <vector>
 
-#include "common/libs/fs/shared_buf.h"
 #include "common/libs/utils/contains.h"
 #include "common/libs/utils/subprocess.h"
+#include "host/commands/cvd/common_utils.h"
 #include "host/commands/cvd/flag.h"
-#include "host/commands/cvd/selector/instance_group_record.h"
-#include "host/commands/cvd/selector/instance_record.h"
-#include "host/commands/cvd/selector/selector_constants.h"
 #include "host/commands/cvd/server_command/server_handler.h"
 #include "host/commands/cvd/server_command/utils.h"
 #include "host/commands/cvd/types.h"
@@ -50,15 +43,10 @@ cvd env ls $SERVICE_NAME $METHOD_NAME - list information on input + output messa
 cvd env type $SERVICE_NAME $REQUEST_MESSAGE_TYPE - outputs the proto the specified request message type
 )";
 
-}  // namespace
-
 class CvdEnvCommandHandler : public CvdServerHandler {
  public:
-  CvdEnvCommandHandler(InstanceManager& instance_manager,
-                       SubprocessWaiter& subprocess_waiter)
-      : instance_manager_{instance_manager},
-        subprocess_waiter_(subprocess_waiter),
-        cvd_env_operations_{"env"} {}
+  CvdEnvCommandHandler(InstanceManager& instance_manager)
+      : instance_manager_{instance_manager}, cvd_env_operations_{"env"} {}
 
   Result<bool> CanHandle(const RequestWithStdio& request) const override {
     auto invocation = ParseInvocation(request.Message());
@@ -67,9 +55,7 @@ class CvdEnvCommandHandler : public CvdServerHandler {
 
   Result<cvd::Response> Handle(const RequestWithStdio& request) override {
     CF_EXPECT(CanHandle(request));
-    CF_EXPECT(VerifyPrecondition(request));
-    cvd_common::Envs envs =
-        cvd_common::ConvertToEnvs(request.Message().command_request().env());
+    cvd_common::Envs envs = request.Envs();
 
     auto [_, subcmd_args] = ParseInvocation(request.Message());
 
@@ -86,9 +72,10 @@ class CvdEnvCommandHandler : public CvdServerHandler {
     Command command =
         is_help ? CF_EXPECT(HelpCommand(request, subcmd_args, envs))
                 : CF_EXPECT(NonHelpCommand(request, subcmd_args, envs));
-    CF_EXPECT(subprocess_waiter_.Setup(command.Start()));
 
-    auto infop = CF_EXPECT(subprocess_waiter_.Wait());
+    siginfo_t infop;
+    command.Start().Wait(&infop, WEXITED);
+
     return ResponseFromSiginfo(infop);
   }
 
@@ -109,26 +96,25 @@ class CvdEnvCommandHandler : public CvdServerHandler {
   Result<Command> HelpCommand(const RequestWithStdio& request,
                               const cvd_common::Args& subcmd_args,
                               const cvd_common::Envs& envs) {
-    CF_EXPECT(Contains(envs, kAndroidHostOut));
+    cvd_common::Envs envs_copy = envs;
+    envs_copy[kAndroidHostOut] = CF_EXPECT(AndroidHostPath(envs));
     return CF_EXPECT(
-        ConstructCvdHelpCommand(kCvdEnvBin, envs, subcmd_args, request));
+        ConstructCvdHelpCommand(kCvdEnvBin, envs_copy, subcmd_args, request));
   }
 
   Result<Command> NonHelpCommand(const RequestWithStdio& request,
                                  const cvd_common::Args& subcmd_args,
                                  const cvd_common::Envs& envs) {
-    const auto& selector_opts =
-        request.Message().command_request().selector_opts();
-    const auto selector_args = cvd_common::ConvertToArgs(selector_opts.args());
+    const auto selector_args = request.SelectorArgs();
 
-    auto instance =
+    auto [instance, group] =
         CF_EXPECT(instance_manager_.SelectInstance(selector_args, envs));
-    const auto& home = instance.GroupProto().home_directory();
+    const auto& home = group.Proto().home_directory();
 
-    const auto& android_host_out = instance.GroupProto().host_artifacts_path();
+    const auto& android_host_out = group.Proto().host_artifacts_path();
     auto cvd_env_bin_path =
         ConcatToString(android_host_out, "/bin/", kCvdEnvBin);
-    const auto& internal_device_name = instance.InternalDeviceName();
+    const auto& internal_device_name = fmt::format("cvd-{}", instance.id());
 
     cvd_common::Args cvd_env_args{internal_device_name};
     cvd_env_args.insert(cvd_env_args.end(), subcmd_args.begin(),
@@ -145,16 +131,16 @@ class CvdEnvCommandHandler : public CvdServerHandler {
   }
 
   InstanceManager& instance_manager_;
-  SubprocessWaiter& subprocess_waiter_;
   std::vector<std::string> cvd_env_operations_;
 
   static constexpr char kCvdEnvBin[] = "cvd_internal_env";
 };
 
-std::unique_ptr<CvdServerHandler> NewCvdEnvCommandHandler(
-    InstanceManager& instance_manager, SubprocessWaiter& subprocess_waiter) {
-  return std::unique_ptr<CvdServerHandler>(
-      new CvdEnvCommandHandler(instance_manager, subprocess_waiter));
-}
+}  // namespace
 
+std::unique_ptr<CvdServerHandler> NewCvdEnvCommandHandler(
+    InstanceManager& instance_manager) {
+  return std::unique_ptr<CvdServerHandler>(
+      new CvdEnvCommandHandler(instance_manager));
+}
 }  // namespace cuttlefish

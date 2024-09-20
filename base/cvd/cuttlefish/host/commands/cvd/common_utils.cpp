@@ -16,9 +16,8 @@
 
 #include "host/commands/cvd/common_utils.h"
 
-#include <memory>
 #include <mutex>
-#include <sstream>
+#include <ostream>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -26,11 +25,19 @@
 
 #include "common/libs/utils/contains.h"
 #include "common/libs/utils/files.h"
-#include "common/libs/utils/users.h"
+#include "common/libs/utils/result.h"
 
 namespace cuttlefish {
 
 namespace {
+
+bool IsValidAndroidHostOutPath(const std::string& path) {
+  std::string start_bin_path = path + "/bin/cvd_internal_start";
+  return FileExists(start_bin_path);
+}
+
+}  // namespace
+
 /*
  * Most branches read the kAndroidHostOut environment variable, but a few read
  * kAndroidSoongHostOut instead. Cvd will set both variables for the subtools
@@ -40,20 +47,23 @@ namespace {
  * - envs["HOME"] if envs["HOME"] + "/bin/cvd_internal_start" exists.
  * - current working directory
  */
-std::string GetNewAndroidHostOut(const cvd_common::Envs& envs) {
-  if (Contains(envs, kAndroidHostOut)) {
-    return envs.at(kAndroidHostOut);
+Result<std::string> AndroidHostPath(const cvd_common::Envs& envs) {
+  auto it = envs.find(kAndroidHostOut);
+  if (it != envs.end() && IsValidAndroidHostOutPath(it->second)) {
+    return it->second;
   }
-  if (Contains(envs, kAndroidSoongHostOut)) {
-    return envs.at(kAndroidSoongHostOut);
+  it = envs.find(kAndroidSoongHostOut);
+  if (it != envs.end() && IsValidAndroidHostOutPath(it->second)) {
+    return it->second;
   }
-  if (Contains(envs, "HOME") &&
-      FileExists(envs.at("HOME") + "/bin/cvd_internal_start")) {
-    return envs.at("HOME");
+  it = envs.find("HOME");
+  if (it != envs.end() && IsValidAndroidHostOutPath(it->second)) {
+    return it->second;
   }
-  return CurrentDirectory();
+  auto current_dir = CurrentDirectory();
+  CF_EXPECT(IsValidAndroidHostOutPath(current_dir));
+  return current_dir;
 }
-}  // namespace
 
 cvd::Request MakeRequest(const MakeRequestForm& request_form) {
   return MakeRequest(request_form, cvd::WAIT_BEHAVIOR_COMPLETE);
@@ -76,12 +86,6 @@ cvd::Request MakeRequest(const MakeRequestForm& request_form,
 
   for (const auto& [key, value] : env) {
     (*command_request->mutable_env())[key] = value;
-  }
-
-  if (!Contains(command_request->env(), kAndroidHostOut)) {
-    const std::string new_android_host_out =
-        GetNewAndroidHostOut(request_form.env);
-    (*command_request->mutable_env())[kAndroidHostOut] = new_android_host_out;
   }
 
   if (!request_form.working_dir) {
@@ -185,6 +189,20 @@ std::string PerUserDir() {
 
 std::string InstanceDatabasePath() {
   return fmt::format("{}/instance_database.binpb", PerUserDir());
+}
+
+std::string DefaultBaseDir() {
+  auto time = std::chrono::system_clock::now().time_since_epoch().count();
+  return fmt::format("{}/{}", PerUserDir(), time);
+}
+
+Result<std::string> GroupDirFromHome(std::string_view dir) {
+  std::string per_user_dir = PerUserDir();
+  // Just in case it has a / at the end, ignore result
+  while (android::base::ConsumeSuffix(&dir, "/")) {}
+  CF_EXPECTF(android::base::ConsumeSuffix(&dir, "/home"),
+             "Unexpected group home directory: {}", dir);
+  return std::string(dir);
 }
 
 }  // namespace cuttlefish

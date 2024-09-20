@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <vector>
 
 #include "common/libs/utils/result.h"
@@ -26,8 +25,6 @@
 #include "host/commands/cvd/server_client.h"
 #include "host/commands/cvd/server_command/host_tool_target_manager.h"
 #include "host/commands/cvd/server_command/server_handler.h"
-#include "host/commands/cvd/server_command/subprocess_waiter.h"
-#include "host/libs/web/android_build_api.h"
 
 namespace cuttlefish {
 
@@ -45,7 +42,6 @@ class RequestContext {
   std::vector<std::unique_ptr<CvdServerHandler>> request_handlers_;
   InstanceLockFileManager& instance_lockfile_manager_;
   InstanceManager& instance_manager_;
-  SubprocessWaiter subprocess_waiter_;
   InstanceLockFileManager lock_file_manager_;
   HostToolTargetManager& host_tool_target_manager_;
   CommandSequenceExecutor command_sequence_executor_;

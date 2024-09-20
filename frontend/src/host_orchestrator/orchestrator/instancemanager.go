@@ -24,14 +24,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
+	apiv1 "github.com/google/android-cuttlefish/frontend/src/host_orchestrator/api/v1"
 	"github.com/google/android-cuttlefish/frontend/src/host_orchestrator/orchestrator/artifacts"
 	"github.com/google/android-cuttlefish/frontend/src/host_orchestrator/orchestrator/cvd"
-	apiv1 "github.com/google/android-cuttlefish/frontend/src/liboperator/api/v1"
 	"github.com/google/android-cuttlefish/frontend/src/liboperator/operator"
 
 	"github.com/hashicorp/go-multierror"
@@ -57,6 +57,7 @@ type AndroidBuild struct {
 type IMPaths struct {
 	RootDir          string
 	ArtifactsRootDir string
+	CVDBugReportsDir string
 }
 
 type CVDSelector struct {
@@ -76,11 +77,11 @@ func (s *CVDSelector) ToCVDCLI() []string {
 }
 
 // Creates a CVD execution context from a regular execution context.
-// If a non-empty user name is provided the returned execution context executes commands as that user.
-func newCVDExecContext(execContext ExecContext, user string) cvd.CVDExecContext {
-	if user != "" {
+// If a non-nil user is provided the returned execution context executes commands as that user.
+func newCVDExecContext(execContext ExecContext, usr *user.User) cvd.CVDExecContext {
+	if usr != nil {
 		return func(ctx context.Context, env []string, name string, arg ...string) *exec.Cmd {
-			newArgs := []string{"-u", user}
+			newArgs := []string{"-u", usr.Username}
 			if env != nil {
 				newArgs = append(newArgs, env...)
 			}
@@ -108,6 +109,15 @@ func createRuntimesRootDir(name string) error {
 
 type cvdFleetOutput struct {
 	Groups []*cvdGroup `json:"groups"`
+}
+
+func (o *cvdFleetOutput) findGroup(name string) (bool, *cvdGroup) {
+	for _, e := range o.Groups {
+		if e.Name == name {
+			return true, e
+		}
+	}
+	return false, nil
 }
 
 type cvdGroup struct {
@@ -173,10 +183,14 @@ func cvdFleetFirstGroup(ctx cvd.CVDExecContext) (*cvdGroup, error) {
 	return fleet.Groups[0], nil
 }
 
-func CVDLogsDir(ctx cvd.CVDExecContext, name string) (string, error) {
-	group, err := cvdFleetFirstGroup(ctx)
+func CVDLogsDir(ctx cvd.CVDExecContext, groupName, name string) (string, error) {
+	fleet, err := cvdFleet(ctx)
 	if err != nil {
 		return "", err
+	}
+	ok, group := fleet.findGroup(groupName)
+	if !ok {
+		return "", operator.NewNotFoundError(fmt.Sprintf("Group %q not found", groupName), nil)
 	}
 	ok, ins := cvdInstances(group.Instances).findByName(name)
 	if !ok {
@@ -319,11 +333,6 @@ const (
 	groupNameArg                 = "--group_name=cvd"
 )
 
-type startCVDHandler struct {
-	ExecContext cvd.CVDExecContext
-	Timeout     time.Duration
-}
-
 type startCVDParams struct {
 	InstanceNumbers  []uint32
 	MainArtifactsDir string
@@ -334,12 +343,9 @@ type startCVDParams struct {
 	BootloaderDir string
 }
 
-func (h *startCVDHandler) Start(p startCVDParams) error {
-	args := []string{groupNameArg, "start", daemonArg, reportAnonymousUsageStatsArg}
-	if len(p.InstanceNumbers) == 1 {
-		// Use legacy `--base_instance_num` when multi-vd is not requested.
-		args = append(args, fmt.Sprintf("--base_instance_num=%d", p.InstanceNumbers[0]))
-	} else {
+func CreateCVD(ctx cvd.CVDExecContext, p startCVDParams) error {
+	args := []string{groupNameArg, "create", daemonArg, reportAnonymousUsageStatsArg}
+	if len(p.InstanceNumbers) > 1 {
 		args = append(args, fmt.Sprintf("--instance_nums=%s", strings.Join(SliceItoa(p.InstanceNumbers), ",")))
 	}
 	args = append(args, fmt.Sprintf("--system_image_dir=%s", p.MainArtifactsDir))
@@ -359,9 +365,8 @@ func (h *startCVDHandler) Start(p startCVDParams) error {
 	opts := cvd.CommandOpts{
 		AndroidHostOut: p.MainArtifactsDir,
 		Home:           p.RuntimeDir,
-		Timeout:        h.Timeout,
 	}
-	cvdCmd := cvd.NewCommand(h.ExecContext, args, opts)
+	cvdCmd := cvd.NewCommand(ctx, args, opts)
 	err := cvdCmd.Run()
 	if err != nil {
 		return fmt.Errorf("launch cvd stage failed: %w", err)

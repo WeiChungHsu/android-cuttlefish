@@ -18,15 +18,10 @@
 
 #include <sys/types.h>
 
-#include <mutex>
-
 #include <android-base/parseint.h>
 #include <android-base/strings.h>
 
-#include "common/libs/fs/shared_buf.h"
-#include "common/libs/fs/shared_fd.h"
 #include "common/libs/utils/contains.h"
-#include "common/libs/utils/json.h"
 #include "common/libs/utils/result.h"
 #include "cuttlefish/host/commands/cvd/cvd_server.pb.h"
 #include "host/commands/cvd/common_utils.h"
@@ -39,8 +34,12 @@
 #include "host/libs/config/config_constants.h"
 
 namespace cuttlefish {
+namespace {
 
-static constexpr char kHelpMessage[] = R"(
+constexpr char kSummaryHelpText[] =
+    "Query status of a single instance group.  Use `cvd fleet` for all devices";
+
+constexpr char kDetailedHelpText[] = R"(
 
 usage: cvd <selector/driver options> <command> <args>
 
@@ -82,6 +81,8 @@ Args:
 
 )";
 
+}  // namespace
+
 class CvdStatusCommandHandler : public CvdServerHandler {
  public:
   CvdStatusCommandHandler(InstanceManager& instance_manager,
@@ -91,9 +92,15 @@ class CvdStatusCommandHandler : public CvdServerHandler {
   Result<cvd::Response> Handle(const RequestWithStdio& request) override;
   cvd_common::Args CmdList() const override;
 
- private:
-  Result<cvd::Response> HandleHelp(const RequestWithStdio&);
+  Result<std::string> SummaryHelp() const override { return kSummaryHelpText; }
 
+  bool ShouldInterceptHelp() const override { return true; }
+
+  Result<std::string> DetailedHelp(std::vector<std::string>&) const override {
+    return kDetailedHelpText;
+  }
+
+ private:
   InstanceManager& instance_manager_;
   HostToolTargetManager& host_tool_target_manager_;
   StatusFetcher status_fetcher_;
@@ -116,8 +123,7 @@ Result<bool> CvdStatusCommandHandler::CanHandle(
 
 static Result<RequestWithStdio> ProcessInstanceNameFlag(
     const RequestWithStdio& request) {
-  cvd_common::Envs envs =
-      cvd_common::ConvertToEnvs(request.Message().command_request().env());
+  cvd_common::Envs envs = request.Envs();
   auto [subcmd, cmd_args] = ParseInvocation(request.Message());
 
   CvdFlag<std::string> instance_name_flag("instance_name");
@@ -144,15 +150,13 @@ static Result<RequestWithStdio> ProcessInstanceNameFlag(
 
   cvd_common::Args new_cmd_args{"cvd", "status"};
   new_cmd_args.insert(new_cmd_args.end(), cmd_args.begin(), cmd_args.end());
-  const auto& selector_opts =
-      request.Message().command_request().selector_opts();
   cvd::Request new_message = MakeRequest({
       .cmd_args = new_cmd_args,
       .env = envs,
-      .selector_args = cvd_common::ConvertToArgs(selector_opts.args()),
+      .selector_args = request.SelectorArgs(),
       .working_dir = request.Message().command_request().working_directory(),
   });
-  return RequestWithStdio(new_message, request.FileDescriptors());
+  return RequestWithStdio::InheritIo(std::move(new_message), (request));
 }
 
 static Result<bool> HasPrint(cvd_common::Args cmd_args) {
@@ -165,27 +169,9 @@ Result<cvd::Response> CvdStatusCommandHandler::Handle(
     const RequestWithStdio& request) {
   CF_EXPECT(CanHandle(request));
 
-  auto precondition_verified = VerifyPrecondition(request);
-  if (!precondition_verified.ok()) {
-    cvd::Response response;
-    response.mutable_command_response();
-    response.mutable_status()->set_code(cvd::Status::FAILED_PRECONDITION);
-    response.mutable_status()->set_message(
-        precondition_verified.error().Message());
-    return response;
-  }
-
-  CF_EXPECT_NE(request.Message().command_request().wait_behavior(),
-               cvd::WAIT_BEHAVIOR_START,
-               "cvd status shouldn't be cvd::WAIT_BEHAVIOR_START");
-
   auto [subcmd, cmd_args] = ParseInvocation(request.Message());
   CF_EXPECT(Contains(supported_subcmds_, subcmd));
   const bool has_print = CF_EXPECT(HasPrint(cmd_args));
-
-  if (CF_EXPECT(IsHelpSubcmd(cmd_args))) {
-    return HandleHelp(request);
-  }
 
   if (!CF_EXPECT(instance_manager_.HasInstanceGroups())) {
     return CF_EXPECT(NoGroupResponse(request));
@@ -199,27 +185,15 @@ Result<cvd::Response> CvdStatusCommandHandler::Handle(
   }
 
   std::string serialized_group_json = instances_json.toStyledString();
-  CF_EXPECT_EQ(WriteAll(request.Err(), entire_stderr_msg),
-               (ssize_t)entire_stderr_msg.size());
+  request.Err() << serialized_group_json;
   if (has_print) {
-    CF_EXPECT_EQ(WriteAll(request.Out(), serialized_group_json),
-                 (ssize_t)serialized_group_json.size());
+    request.Out() << serialized_group_json;
   }
   return response;
 }
 
 std::vector<std::string> CvdStatusCommandHandler::CmdList() const {
   return supported_subcmds_;
-}
-
-Result<cvd::Response> CvdStatusCommandHandler::HandleHelp(
-    const RequestWithStdio& request) {
-  cvd::Response response;
-  response.mutable_command_response();  // Sets oneof member
-  response.mutable_status()->set_code(cvd::Status::OK);
-  CF_EXPECT_EQ(WriteAll(request.Out(), kHelpMessage),
-               (ssize_t)strnlen(kHelpMessage, sizeof(kHelpMessage) - 1));
-  return response;
 }
 
 std::unique_ptr<CvdServerHandler> NewCvdStatusCommandHandler(

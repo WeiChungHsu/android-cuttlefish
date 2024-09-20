@@ -16,10 +16,9 @@
 
 #pragma once
 
-#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 
-#include <memory>
 #include <optional>
 #include <vector>
 
@@ -28,24 +27,42 @@
 #include "common/libs/fs/shared_fd.h"
 #include "common/libs/utils/result.h"
 #include "common/libs/utils/unix_sockets.h"
+#include "host/commands/cvd/types.h"
 
 namespace cuttlefish {
 
 class RequestWithStdio {
  public:
-  RequestWithStdio(cvd::Request, std::vector<SharedFD>);
+  static RequestWithStdio StdIo(cvd::Request);
+  static RequestWithStdio NullIo(cvd::Request);
+  static RequestWithStdio InheritIo(cvd::Request, const RequestWithStdio&);
 
-  SharedFD Client() const;
   const cvd::Request& Message() const;
-  const std::vector<SharedFD>& FileDescriptors() const;
-  SharedFD In() const;
-  SharedFD Out() const;
-  SharedFD Err() const;
-  std::optional<SharedFD> Extra() const;
+  std::istream& In() const;
+  std::ostream& Out() const;
+  std::ostream& Err() const;
+
+  bool IsNullIo() const;
+
+  // Convenient accessors to commonly used properties in the underlying message
+  cvd_common::Args Args() const {
+    return cvd_common::ConvertToArgs(Message().command_request().args());
+  }
+  cvd_common::Args SelectorArgs() const {
+    return cvd_common::ConvertToArgs(
+        Message().command_request().selector_opts().args());
+  }
+  cvd_common::Envs Envs() const {
+    return cvd_common::ConvertToEnvs(Message().command_request().env());
+  }
 
  private:
+  RequestWithStdio(cvd::Request, std::istream&, std::ostream&, std::ostream&);
+
   cvd::Request message_;
-  std::vector<SharedFD> fds_;
+  std::istream& in_;
+  std::ostream& out_;
+  std::ostream& err_;
 };
 
 Result<UnixMessageSocket> GetClient(const SharedFD& client);

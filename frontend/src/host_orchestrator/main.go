@@ -31,8 +31,6 @@ import (
 	"github.com/google/android-cuttlefish/frontend/src/host_orchestrator/orchestrator"
 	"github.com/google/android-cuttlefish/frontend/src/host_orchestrator/orchestrator/debug"
 	"github.com/gorilla/mux"
-
-	"github.com/google/uuid"
 )
 
 const (
@@ -96,13 +94,18 @@ func newOperatorProxy(port int) *httputil.ReverseProxy {
 	if err != nil {
 		log.Fatalf("Invalid operator port (%d): %v", port, err)
 	}
-	return httputil.NewSingleHostReverseProxy(operatorURL)
+	proxy := httputil.NewSingleHostReverseProxy(operatorURL)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("request %q failed: proxy error: %v", r.Method+" "+r.URL.Path, err)
+		w.Header().Add("x-cutf-proxy", "ho-operator")
+		w.WriteHeader(http.StatusBadGateway)
+	}
+	return proxy
 }
 
 func main() {
-	httpPort := flag.Int("http_port", 2081, "Port to listen on for HTTP requests.")
-	cvdUser := flag.String("cvd_user", "", "User to execute cvd as.")
-	cvdCreationTimeoutSecs := flag.Int("cvd_creation_timeout_secs", 420, "CVD creation timeout in seconds")
+	httpPort := flag.Int("http_port", 2080, "Port to listen on for HTTP requests.")
+	cvdUsername := flag.String("cvd_user", "", "User to execute cvd as.")
 	operatorPort := flag.Int("operator_http_port", 1080, "Port where the operator is listening.")
 	abURL := flag.String("android_build_url", defaultAndroidBuildURL, "URL to an Android Build API.")
 	imRootDir := flag.String("cvd_artifacts_dir", defaultCVDArtifactsDir(), "Directory where cvd will download android build artifacts to.")
@@ -117,11 +120,21 @@ func main() {
 	imPaths := orchestrator.IMPaths{
 		RootDir:          *imRootDir,
 		ArtifactsRootDir: filepath.Join(*imRootDir, "artifacts"),
+		CVDBugReportsDir: filepath.Join(*imRootDir, "cvdbugreports"),
+	}
+
+	var cvdUser *user.User
+	if *cvdUsername != "" {
+		var err error
+		cvdUser, err = user.Lookup(*cvdUsername)
+		if err != nil {
+			log.Fatalf("failed to get cvd user: %v", err)
+		}
 	}
 	om := orchestrator.NewMapOM()
 	uamOpts := orchestrator.UserArtifactsManagerOpts{
-		RootDir:     filepath.Join(*imRootDir, "user_artifacts"),
-		NameFactory: func() string { return uuid.New().String() },
+		RootDir: filepath.Join(*imRootDir, "user_artifacts"),
+		Owner:   cvdUser,
 	}
 	uam := orchestrator.NewUserArtifactsManagerImpl(uamOpts)
 	debugStaticVars := debug.StaticVariables{}
@@ -130,8 +143,7 @@ func main() {
 		Config: orchestrator.Config{
 			Paths:                  imPaths,
 			AndroidBuildServiceURL: *abURL,
-			CVDCreationTimeout:     time.Duration(*cvdCreationTimeoutSecs) * time.Second,
-			CVDUser:                *cvdUser,
+			CVDUser:                cvdUser,
 		},
 		OperationManager:      om,
 		WaitOperationDuration: 2 * time.Minute,

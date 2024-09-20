@@ -14,13 +14,10 @@
  * limitations under the License.
  */
 
-#include <filesystem>
 #include <fstream>
-#include <iostream>
 
 #include <android-base/file.h>
 
-#include "common/libs/fs/shared_buf.h"
 #include "common/libs/utils/files.h"
 #include "common/libs/utils/flag_parser.h"
 #include "common/libs/utils/result.h"
@@ -171,7 +168,14 @@ class AcloudMixSuperImageCommand : public CvdServerHandler {
     return false;
   }
 
+  // not intended to be used by the user
   cvd_common::Args CmdList() const override { return {}; }
+  // not intended to show up in help
+  Result<std::string> SummaryHelp() const override { return ""; }
+  bool ShouldInterceptHelp() const override { return false; }
+  Result<std::string> DetailedHelp(std::vector<std::string>&) const override {
+    return "";
+  }
 
   Result<cvd::Response> Handle(const RequestWithStdio& request) override {
     CF_EXPECT(CanHandle(request));
@@ -192,7 +196,7 @@ class AcloudMixSuperImageCommand : public CvdServerHandler {
     CF_EXPECT(ConsumeFlags(mixsuperimage_flags, invocation.arguments),
               "Failed to process mix-super-image flag.");
     if (help) {
-      WriteAll(request.Out(), kMixSuperImageHelpMessage);
+      request.Out() << kMixSuperImageHelpMessage;
       return response;
     }
 
@@ -231,13 +235,13 @@ class AcloudMixSuperImageCommand : public CvdServerHandler {
     CF_EXPECT(_RewriteMiscInfo(new_misc_info_path, misc_info_path,
                                lpmake_binary, get_image));
 
-    Command command(build_super_image_binary);
-    command.AddParameter(new_misc_info_path);
-    command.AddParameter(output_path);
-    auto subprocess = command.Start();
-    CF_EXPECT(subprocess.Started());
-    CF_EXPECT(waiter_.Setup(std::move(subprocess)));
-    CF_EXPECT(waiter_.Wait());
+    Subprocess subprocess = Command(build_super_image_binary)
+                                .AddParameter(new_misc_info_path)
+                                .AddParameter(output_path)
+                                .Start();
+
+    CF_EXPECT(subprocess.Wait() == 0);
+
     return {};
   }
 
@@ -288,8 +292,6 @@ class AcloudMixSuperImageCommand : public CvdServerHandler {
                                       });
         });
   }
-
-  SubprocessWaiter waiter_;
 };
 
 std::unique_ptr<CvdServerHandler> NewAcloudMixSuperImageCommand() {

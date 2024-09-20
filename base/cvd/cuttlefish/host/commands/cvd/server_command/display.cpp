@@ -18,8 +18,6 @@
 
 #include <android-base/strings.h>
 
-#include <iostream>
-#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -28,10 +26,10 @@
 #include "common/libs/fs/shared_buf.h"
 #include "common/libs/utils/contains.h"
 #include "common/libs/utils/subprocess.h"
+#include "common/libs/utils/users.h"
+#include "host/commands/cvd/common_utils.h"
 #include "host/commands/cvd/flag.h"
 #include "host/commands/cvd/selector/instance_database_types.h"
-#include "host/commands/cvd/selector/instance_group_record.h"
-#include "host/commands/cvd/selector/instance_record.h"
 #include "host/commands/cvd/selector/selector_constants.h"
 #include "host/commands/cvd/server_command/server_handler.h"
 #include "host/commands/cvd/server_command/utils.h"
@@ -53,26 +51,21 @@ Commands:
     list                Prints the currently connected displays.
     remove              Removes a display from a given device.
 )";
-}
 
 class CvdDisplayCommandHandler : public CvdServerHandler {
  public:
-  CvdDisplayCommandHandler(InstanceManager& instance_manager,
-                           SubprocessWaiter& subprocess_waiter)
+  CvdDisplayCommandHandler(InstanceManager& instance_manager)
       : instance_manager_{instance_manager},
-        subprocess_waiter_(subprocess_waiter),
         cvd_display_operations_{"display"} {}
 
-  Result<bool> CanHandle(const RequestWithStdio& request) const {
+  Result<bool> CanHandle(const RequestWithStdio& request) const override {
     auto invocation = ParseInvocation(request.Message());
     return Contains(cvd_display_operations_, invocation.command);
   }
 
   Result<cvd::Response> Handle(const RequestWithStdio& request) override {
     CF_EXPECT(CanHandle(request));
-    CF_EXPECT(VerifyPrecondition(request));
-    cvd_common::Envs envs =
-        cvd_common::ConvertToEnvs(request.Message().command_request().env());
+    cvd_common::Envs envs = request.Envs();
 
     auto [_, subcmd_args] = ParseInvocation(request.Message());
 
@@ -81,9 +74,10 @@ class CvdDisplayCommandHandler : public CvdServerHandler {
     Command command =
         is_help ? CF_EXPECT(HelpCommand(request, subcmd_args, envs))
                 : CF_EXPECT(NonHelpCommand(request, subcmd_args, envs));
-    CF_EXPECT(subprocess_waiter_.Setup(command.Start()));
 
-    auto infop = CF_EXPECT(subprocess_waiter_.Wait());
+    siginfo_t infop;
+    command.Start().Wait(&infop, WEXITED);
+
     return ResponseFromSiginfo(infop);
   }
 
@@ -104,14 +98,14 @@ class CvdDisplayCommandHandler : public CvdServerHandler {
   Result<Command> HelpCommand(const RequestWithStdio& request,
                               const cvd_common::Args& subcmd_args,
                               cvd_common::Envs envs) {
-    CF_EXPECT(Contains(envs, kAndroidHostOut));
+    auto android_host_out = CF_EXPECT(AndroidHostPath(envs));
     auto cvd_display_bin_path =
-        ConcatToString(envs.at(kAndroidHostOut), "/bin/", kDisplayBin);
-    std::string home = Contains(envs, "HOME")
-                           ? envs.at("HOME")
-                           : CF_EXPECT(SystemWideUserHome());
+        ConcatToString(android_host_out, "/bin/", kDisplayBin);
+    std::string home = Contains(envs, "HOME") ? envs.at("HOME")
+                                              : CF_EXPECT(SystemWideUserHome());
     envs["HOME"] = home;
-    envs[kAndroidSoongHostOut] = envs.at(kAndroidHostOut);
+    envs[kAndroidHostOut] = android_host_out;
+    envs[kAndroidSoongHostOut] = android_host_out;
     ConstructCommandParam construct_cmd_param{
         .bin_path = cvd_display_bin_path,
         .home = home,
@@ -119,9 +113,7 @@ class CvdDisplayCommandHandler : public CvdServerHandler {
         .envs = envs,
         .working_dir = request.Message().command_request().working_directory(),
         .command_name = kDisplayBin,
-        .in = request.In(),
-        .out = request.Out(),
-        .err = request.Err()};
+        .null_stdio = request.IsNullIo()};
     Command command = CF_EXPECT(ConstructCommand(construct_cmd_param));
     return command;
   }
@@ -138,33 +130,29 @@ class CvdDisplayCommandHandler : public CvdServerHandler {
       extra_queries.emplace_back(selector::kInstanceIdField, *instance_num_opt);
     }
 
-    const auto& selector_opts =
-        request.Message().command_request().selector_opts();
-    const auto selector_args = cvd_common::ConvertToArgs(selector_opts.args());
+    const auto selector_args = request.SelectorArgs();
 
-    auto instance = CF_EXPECT(
+    auto [instance, group] = CF_EXPECT(
         instance_manager_.SelectInstance(selector_args, envs, extra_queries));
-    const auto& home = instance.GroupProto().home_directory();
+    const auto& home = group.Proto().home_directory();
 
-    const auto& android_host_out = instance.GroupProto().host_artifacts_path();
+    const auto& android_host_out = group.Proto().host_artifacts_path();
     auto cvd_display_bin_path =
         ConcatToString(android_host_out, "/bin/", kDisplayBin);
 
     cvd_common::Args cvd_env_args{subcmd_args};
-    cvd_env_args.push_back(
-        ConcatToString("--instance_num=", instance.InstanceId()));
+    cvd_env_args.push_back(ConcatToString("--instance_num=", instance.id()));
     envs["HOME"] = home;
     envs[kAndroidHostOut] = android_host_out;
     envs[kAndroidSoongHostOut] = android_host_out;
 
     std::stringstream command_to_issue;
-    command_to_issue << "HOME=" << home << " " << kAndroidHostOut << "="
-                     << android_host_out << " " << kAndroidSoongHostOut << "="
-                     << android_host_out << " " << cvd_display_bin_path << " ";
+    request.Err() << "HOME=" << home << " " << kAndroidHostOut << "="
+                  << android_host_out << " " << kAndroidSoongHostOut << "="
+                  << android_host_out << " " << cvd_display_bin_path << " ";
     for (const auto& arg : cvd_env_args) {
-      command_to_issue << arg << " ";
+      request.Err() << arg << " ";
     }
-    WriteAll(request.Err(), command_to_issue.str());
 
     ConstructCommandParam construct_cmd_param{
         .bin_path = cvd_display_bin_path,
@@ -173,9 +161,7 @@ class CvdDisplayCommandHandler : public CvdServerHandler {
         .envs = envs,
         .working_dir = request.Message().command_request().working_directory(),
         .command_name = kDisplayBin,
-        .in = request.In(),
-        .out = request.Out(),
-        .err = request.Err()};
+        .null_stdio = request.IsNullIo()};
     Command command = CF_EXPECT(ConstructCommand(construct_cmd_param));
     return command;
   }
@@ -190,15 +176,16 @@ class CvdDisplayCommandHandler : public CvdServerHandler {
   }
 
   InstanceManager& instance_manager_;
-  SubprocessWaiter& subprocess_waiter_;
   std::vector<std::string> cvd_display_operations_;
   static constexpr char kDisplayBin[] = "cvd_internal_display";
 };
 
+}  // namespace
+
 std::unique_ptr<CvdServerHandler> NewCvdDisplayCommandHandler(
-    InstanceManager& instance_manager, SubprocessWaiter& subprocess_waiter) {
+    InstanceManager& instance_manager) {
   return std::unique_ptr<CvdServerHandler>(
-      new CvdDisplayCommandHandler(instance_manager, subprocess_waiter));
+      new CvdDisplayCommandHandler(instance_manager));
 }
 
 }  // namespace cuttlefish

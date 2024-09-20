@@ -18,9 +18,10 @@
 
 #include <unistd.h>
 
-#include <chrono>
 #include <cstdio>
+#include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <android-base/file.h>
@@ -44,7 +45,6 @@
 namespace cuttlefish {
 
 using cvd::config::EnvironmentSpecification;
-using cvd::config::Instance;
 
 namespace {
 
@@ -170,11 +170,6 @@ std::vector<Flag> GetFlagsVector(LoadFlags& load_flags) {
   return flags;
 }
 
-std::string DefaultBaseDir() {
-  auto time = std::chrono::system_clock::now().time_since_epoch().count();
-  return fmt::format("{}/{}", PerUserDir(), time);
-}
-
 void MakeAbsolute(std::string& path, const std::string& working_dir) {
   if (path.size() > 0 && path[0] == '/') {
     return;
@@ -272,20 +267,53 @@ Result<LoadDirectories> GenerateLoadDirectories(
         result.target_directory + "/" + kHostToolsSubdirectory;
   }
 
-  result.system_image_directory_flag =
-      "--system_image_dir=" +
+  result.system_image_directory_flag_value =
       android::base::Join(system_image_directories, ',');
   return result;
 }
 
+std::vector<std::string> FillEmptyInstanceNames(
+    std::vector<std::string> instance_names) {
+  std::set<std::string_view> used;
+  for (const auto& name : instance_names) {
+    if (name.empty()) {
+      continue;
+    }
+    used.insert(name);
+  }
+  int index = 1;
+  for (auto& name : instance_names) {
+    if (!name.empty()) {
+      continue;
+    }
+    while (used.find(std::to_string(index)) != used.end()) {
+      ++index;
+    }
+    name = std::to_string(index++);
+    used.insert(name);
+  }
+  return instance_names;
+}
+
 Result<CvdFlags> ParseCvdConfigs(const EnvironmentSpecification& launch,
                                  const LoadDirectories& load_directories) {
-  return CvdFlags{.launch_cvd_flags = CF_EXPECT(ParseLaunchCvdConfigs(launch)),
-                  .selector_flags = ParseSelectorConfigs(launch),
-                  .fetch_cvd_flags = CF_EXPECT(ParseFetchCvdConfigs(
-                      launch, load_directories.target_directory,
-                      load_directories.target_subdirectories)),
-                  .load_directories = load_directories};
+  CvdFlags flags{
+      .launch_cvd_flags = CF_EXPECT(ParseLaunchCvdConfigs(launch)),
+      .selector_flags = ParseSelectorConfigs(launch),
+      .fetch_cvd_flags = CF_EXPECT(
+          ParseFetchCvdConfigs(launch, load_directories.target_directory,
+                               load_directories.target_subdirectories)),
+      .load_directories = load_directories,
+  };
+  if (launch.common().has_group_name()) {
+    flags.group_name = launch.common().group_name();
+  }
+  for (const auto& instance : launch.instances()) {
+    flags.instance_names.push_back(instance.name());
+  }
+  flags.instance_names =
+      FillEmptyInstanceNames(std::move(flags.instance_names));
+  return flags;
 }
 
 }  // namespace

@@ -19,9 +19,6 @@
 #include <android-base/file.h>
 #include <android-base/strings.h>
 
-#include <iostream>
-#include <mutex>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -29,19 +26,21 @@
 #include "common/libs/fs/shared_buf.h"
 #include "common/libs/utils/contains.h"
 #include "common/libs/utils/subprocess.h"
+#include "host/commands/cvd/common_utils.h"
 #include "host/commands/cvd/flag.h"
-#include "host/commands/cvd/selector/instance_database_types.h"
 #include "host/commands/cvd/selector/instance_group_record.h"
-#include "host/commands/cvd/selector/instance_record.h"
-#include "host/commands/cvd/selector/selector_constants.h"
 #include "host/commands/cvd/server_command/host_tool_target_manager.h"
 #include "host/commands/cvd/server_command/server_handler.h"
 #include "host/commands/cvd/server_command/utils.h"
 #include "host/commands/cvd/types.h"
 
 namespace cuttlefish {
+namespace {
 
-static constexpr char kSnapshot[] =
+constexpr char kSummaryHelpText[] =
+    "Suspend/resume the cuttlefish device, or take snapshot of the device";
+
+constexpr char kDetailedHelpText[] =
     R"(Cuttlefish Virtual Device (CVD) CLI.
 
 Suspend/resume the cuttlefish device, or take snapshot of the device
@@ -52,9 +51,6 @@ Common:
   Selector Flags:
     --group_name=<name>       The name of the instance group
     --snapshot_path=<path>>   Directory that contains saved snapshot files
-
-  Args:
-    --help                    print this message
 
 Crosvm:
   --snapshot_compat           Tells the device to be snapshot-compatible
@@ -69,10 +65,8 @@ QEMU:
 class CvdSnapshotCommandHandler : public CvdServerHandler {
  public:
   CvdSnapshotCommandHandler(InstanceManager& instance_manager,
-                            SubprocessWaiter& subprocess_waiter,
                             HostToolTargetManager& host_tool_target_manager)
       : instance_manager_{instance_manager},
-        subprocess_waiter_(subprocess_waiter),
         host_tool_target_manager_(host_tool_target_manager),
         cvd_snapshot_operations_{"suspend", "resume", "snapshot_take"} {}
 
@@ -83,9 +77,7 @@ class CvdSnapshotCommandHandler : public CvdServerHandler {
 
   Result<cvd::Response> Handle(const RequestWithStdio& request) override {
     CF_EXPECT(CanHandle(request));
-    CF_EXPECT(VerifyPrecondition(request));
-    cvd_common::Envs envs =
-        cvd_common::ConvertToEnvs(request.Message().command_request().env());
+    cvd_common::Envs envs = request.Envs();
 
     auto [subcmd, subcmd_args] = ParseInvocation(request.Message());
 
@@ -95,22 +87,13 @@ class CvdSnapshotCommandHandler : public CvdServerHandler {
     }
     LOG(DEBUG) << "Calling new handler with " << subcmd << ": " << ss.str();
 
-    auto help_flag = CvdFlag("help", false);
-    cvd_common::Args subcmd_args_copy{subcmd_args};
-    auto help_parse_result = help_flag.CalculateFlag(subcmd_args_copy);
-    bool is_help = help_parse_result.ok() && (*help_parse_result);
-
-    if (is_help) {
-      auto help_response = CF_EXPECT(HandleHelp(request.Err()));
-      return help_response;
-    }
-
     // may modify subcmd_args by consuming in parsing
     Command command =
-        CF_EXPECT(NonHelpCommand(request, subcmd, subcmd_args, envs));
-    CF_EXPECT(subprocess_waiter_.Setup(command.Start()));
+        CF_EXPECT(GenerateCommand(request, subcmd, subcmd_args, envs));
 
-    auto infop = CF_EXPECT(subprocess_waiter_.Wait());
+    siginfo_t infop;
+    command.Start().Wait(&infop, WEXITED);
+
     return ResponseFromSiginfo(infop);
   }
 
@@ -119,26 +102,20 @@ class CvdSnapshotCommandHandler : public CvdServerHandler {
                             cvd_snapshot_operations_.end());
   }
 
- private:
-  Result<cvd::Response> HandleHelp(const SharedFD& client_stderr) {
-    std::string help_message(kSnapshot);
-    help_message.append("\n");
-    CF_EXPECT(
-        WriteAll(client_stderr, help_message) == (ssize_t)help_message.size(),
-        "Failed to write the help message");
-    cvd::Response response;
-    response.mutable_command_response();
-    response.mutable_status()->set_code(cvd::Status::OK);
-    return response;
+  Result<std::string> SummaryHelp() const override { return kSummaryHelpText; }
+
+  bool ShouldInterceptHelp() const override { return true; }
+
+  Result<std::string> DetailedHelp(std::vector<std::string>&) const override {
+    return kDetailedHelpText;
   }
 
-  Result<Command> NonHelpCommand(const RequestWithStdio& request,
-                                 const std::string& subcmd,
-                                 cvd_common::Args& subcmd_args,
-                                 cvd_common::Envs envs) {
-    const auto& selector_opts =
-        request.Message().command_request().selector_opts();
-    const auto selector_args = cvd_common::ConvertToArgs(selector_opts.args());
+ private:
+  Result<Command> GenerateCommand(const RequestWithStdio& request,
+                                  const std::string& subcmd,
+                                  cvd_common::Args& subcmd_args,
+                                  cvd_common::Envs envs) {
+    const auto selector_args = request.SelectorArgs();
 
     // create a string that is comma-separated instance IDs
     auto instance_group =
@@ -158,14 +135,12 @@ class CvdSnapshotCommandHandler : public CvdServerHandler {
     envs[kAndroidHostOut] = android_host_out;
     envs[kAndroidSoongHostOut] = android_host_out;
 
-    std::stringstream command_to_issue;
-    command_to_issue << "HOME=" << home << " " << kAndroidHostOut << "="
-                     << android_host_out << " " << kAndroidSoongHostOut << "="
-                     << android_host_out << " " << cvd_snapshot_bin_path << " ";
+    request.Err() << "HOME=" << home << " " << kAndroidHostOut << "="
+                  << android_host_out << " " << kAndroidSoongHostOut << "="
+                  << android_host_out << " " << cvd_snapshot_bin_path << " ";
     for (const auto& arg : cvd_snapshot_args) {
-      command_to_issue << arg << " ";
+      request.Err() << arg << " ";
     }
-    WriteAll(request.Err(), command_to_issue.str());
 
     ConstructCommandParam construct_cmd_param{
         .bin_path = cvd_snapshot_bin_path,
@@ -174,9 +149,7 @@ class CvdSnapshotCommandHandler : public CvdServerHandler {
         .envs = envs,
         .working_dir = request.Message().command_request().working_directory(),
         .command_name = android::base::Basename(cvd_snapshot_bin_path),
-        .in = request.In(),
-        .out = request.Out(),
-        .err = request.Err()};
+        .null_stdio = request.IsNullIo()};
     Command command = CF_EXPECT(ConstructCommand(construct_cmd_param));
     return command;
   }
@@ -191,16 +164,17 @@ class CvdSnapshotCommandHandler : public CvdServerHandler {
   }
 
   InstanceManager& instance_manager_;
-  SubprocessWaiter& subprocess_waiter_;
   HostToolTargetManager& host_tool_target_manager_;
   std::vector<std::string> cvd_snapshot_operations_;
 };
 
+}  // namespace
+
 std::unique_ptr<CvdServerHandler> NewCvdSnapshotCommandHandler(
-    InstanceManager& instance_manager, SubprocessWaiter& subprocess_waiter,
+    InstanceManager& instance_manager,
     HostToolTargetManager& host_tool_target_manager) {
   return std::unique_ptr<CvdServerHandler>(new CvdSnapshotCommandHandler(
-      instance_manager, subprocess_waiter, host_tool_target_manager));
+      instance_manager, host_tool_target_manager));
 }
 
 }  // namespace cuttlefish

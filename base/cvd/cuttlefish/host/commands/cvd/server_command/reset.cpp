@@ -17,11 +17,10 @@
 #include "host/commands/cvd/server_command/reset.h"
 
 #include <iostream>
-#include <sstream>
 
-#include "common/libs/fs/shared_buf.h"
 #include "common/libs/utils/files.h"
 #include "common/libs/utils/flag_parser.h"
+#include "host/commands/cvd/common_utils.h"
 #include "host/commands/cvd/instance_manager.h"
 #include "host/commands/cvd/reset_client_utils.h"
 #include "host/commands/cvd/server_command/server_handler.h"
@@ -30,7 +29,11 @@
 namespace cuttlefish {
 namespace {
 
-static constexpr char kHelpMessage[] = R"(usage: cvd reset <args>
+constexpr char kSummaryHelpText[] =
+    "Used to stop devices, optionally clean up instance files, and shut down "
+    "the deprecated cvd server process";
+
+constexpr char kDetailedHelpText[] = R"(usage: cvd reset <args>
 
 * Warning: Cvd reset is an experimental implementation. When you are in panic,
 cvd reset is the last resort.
@@ -62,9 +65,7 @@ description:
   5. Optionally, cleans up the runtime files of the stopped devices.)";
 
 struct ParsedFlags {
-  bool is_help = false;
   bool clean_runtime_dir = true;
-  bool device_by_cvd_only = false;
   bool is_confirmed_by_flag = false;
   std::optional<android::base::LogSeverity> log_level;
 };
@@ -78,26 +79,16 @@ static Result<ParsedFlags> ParseResetFlags(cvd_common::Args subcmd_args) {
   ParsedFlags parsed_flags;
   std::string verbosity_flag_value;
 
-  Flag y_flag =
-      Flag()
-          .Alias({FlagAliasMode::kFlagExact, "-y"})
-          .Alias({FlagAliasMode::kFlagExact, "--yes"})
-          .Setter([&parsed_flags](const FlagMatch&) -> Result<void> {
-            parsed_flags.is_confirmed_by_flag = true;
-            return {};
-          });
-  Flag help_flag = Flag()
-                       .Alias({FlagAliasMode::kFlagExact, "-h"})
-                       .Alias({FlagAliasMode::kFlagExact, "--help"})
-                       .Setter([&parsed_flags](const FlagMatch&) -> Result<void> {
-                         parsed_flags.is_help = true;
-                         return {};
-                       });
+  Flag y_flag = Flag()
+                    .Alias({FlagAliasMode::kFlagExact, "-y"})
+                    .Alias({FlagAliasMode::kFlagExact, "--yes"})
+                    .Setter([&parsed_flags](const FlagMatch&) -> Result<void> {
+                      parsed_flags.is_confirmed_by_flag = true;
+                      return {};
+                    });
   std::vector<Flag> flags{
-      GflagsCompatFlag("device-by-cvd-only", parsed_flags.device_by_cvd_only),
       y_flag,
       GflagsCompatFlag("clean-runtime-dir", parsed_flags.clean_runtime_dir),
-      help_flag,
       GflagsCompatFlag("verbosity", verbosity_flag_value),
       UnexpectedArgumentGuard()};
   CF_EXPECT(ConsumeFlags(flags, subcmd_args));
@@ -139,10 +130,6 @@ class CvdResetCommandHandler : public CvdServerHandler {
     if (options.log_level) {
       SetMinimumVerbosity(options.log_level.value());
     }
-    if (options.is_help) {
-      std::cout << kHelpMessage << std::endl;
-      return {};
-    }
 
     // cvd reset. Give one more opportunity
     if (!options.is_confirmed_by_flag && !GetUserConfirm()) {
@@ -150,7 +137,7 @@ class CvdResetCommandHandler : public CvdServerHandler {
       return {};
     }
 
-    instance_manager_.CvdClear(request.Out(), request.Err());
+    instance_manager_.CvdClear(request);
     // The instance database is obsolete now, clear it.
     auto instance_db_deleted = RemoveFile(InstanceDatabasePath());
     if (!instance_db_deleted) {
@@ -165,14 +152,21 @@ class CvdResetCommandHandler : public CvdServerHandler {
                  << server_kill_res.error().Message();
     }
     CF_EXPECT(KillAllCuttlefishInstances(
-        {.cvd_server_children_only = options.device_by_cvd_only,
-         .clear_instance_dirs = options.clean_runtime_dir}));
+        /* clear_instance_dirs*/ options.clean_runtime_dir));
     cvd::Response response;
     response.mutable_command_response();
     response.mutable_status()->set_code(cvd::Status::OK);
     return response;
   }
   cvd_common::Args CmdList() const override { return {kResetSubcmd}; }
+
+  Result<std::string> SummaryHelp() const override { return kSummaryHelpText; }
+
+  bool ShouldInterceptHelp() const override { return true; }
+
+  Result<std::string> DetailedHelp(std::vector<std::string>&) const override {
+    return kDetailedHelpText;
+  }
 
  private:
   static constexpr char kResetSubcmd[] = "reset";

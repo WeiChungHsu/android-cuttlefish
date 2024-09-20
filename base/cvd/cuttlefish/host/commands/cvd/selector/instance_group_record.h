@@ -19,43 +19,48 @@
 #include <string>
 #include <vector>
 
-#include "common/libs/utils/json.h"
 #include "common/libs/utils/result.h"
 #include "cuttlefish/host/commands/cvd/selector/cvd_persistent_data.pb.h"
-#include "host/commands/cvd/selector/constant_reference.h"
 #include "host/commands/cvd/selector/instance_database_types.h"
 
 namespace cuttlefish {
 namespace selector {
 
-class LocalInstance;
-
 class LocalInstanceGroup {
  public:
-  static Result<LocalInstanceGroup> Create(const cvd::InstanceGroup& group_proto);
+  static Result<LocalInstanceGroup> Create(
+      const cvd::InstanceGroup& group_proto);
 
   LocalInstanceGroup(LocalInstanceGroup&&) = default;
   LocalInstanceGroup(const LocalInstanceGroup&) = default;
   LocalInstanceGroup& operator=(const LocalInstanceGroup&) = default;
 
   static Result<LocalInstanceGroup> Deserialize(const Json::Value& group_json);
+  static bool InstanceIsActive(const cvd::Instance& instance);
 
-  const std::string& InternalGroupName() const { return internal_group_name_; }
   const std::string& GroupName() const { return group_proto_.name(); }
   const std::string& HomeDir() const { return group_proto_.home_directory(); }
+  void SetHomeDir(const std::string& home_dir);
   const std::string& HostArtifactsPath() const {
     return group_proto_.host_artifacts_path();
   }
+  void SetHostArtifactsPath(const std::string& host_artifacts_path);
   const std::string& ProductOutPath() const {
     return group_proto_.product_out_path();
   }
+  void SetProductOutPath(const std::string& product_out_path);
   TimeStamp StartTime() const;
-  const std::vector<LocalInstance>& Instances() const { return instances_; }
-  const cvd::InstanceGroup& Proto() const {
-    return group_proto_;
-  }
+  void SetStartTime(TimeStamp time);
+  const std::vector<cvd::Instance>& Instances() const { return instances_; }
+  std::vector<cvd::Instance>& Instances() { return instances_; }
+  bool HasActiveInstances() const;
+  const cvd::InstanceGroup& Proto() const { return group_proto_; }
+  void SetAllStates(cvd::InstanceState state);
 
-  std::vector<LocalInstance> FindById(const unsigned id) const;
+  std::string AssemblyDir() const;
+  std::string InstanceDir(const cvd::Instance&) const;
+
+  std::vector<cvd::Instance> FindById(const unsigned id) const;
   /**
    * Find by per-instance name.
    *
@@ -63,17 +68,18 @@ class LocalInstanceGroup {
    * "foo" or "4" is the per-instance names, and "cvd-foo" or "cvd-4" is
    * the device name.
    */
-  std::vector<LocalInstance> FindByInstanceName(
+  std::vector<cvd::Instance> FindByInstanceName(
       const std::string& instance_name) const;
 
  private:
   LocalInstanceGroup(const cvd::InstanceGroup& group_proto,
-                     const std::vector<LocalInstance>& instances);
+                     const std::vector<cvd::Instance>& instances);
 
-  std::string internal_group_name_;
   cvd::InstanceGroup group_proto_;
-  std::vector<LocalInstance> instances_;
+  std::vector<cvd::Instance> instances_;
 };
+
+int AdbPort(const cvd::Instance& instance);
 
 }  // namespace selector
 }  // namespace cuttlefish

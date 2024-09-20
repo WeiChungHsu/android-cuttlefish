@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,7 +29,7 @@ struct LoadDirectories {
   std::vector<std::string> target_subdirectories;
   std::string launch_home_directory;
   std::string host_package_directory;
-  std::string system_image_directory_flag;
+  std::string system_image_directory_flag_value;
 };
 
 struct CvdFlags {
@@ -36,6 +37,8 @@ struct CvdFlags {
   std::vector<std::string> selector_flags;
   std::vector<std::string> fetch_cvd_flags;
   LoadDirectories load_directories;
+  std::optional<std::string> group_name;
+  std::vector<std::string> instance_names;
 };
 
 struct Override {

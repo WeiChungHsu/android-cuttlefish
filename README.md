@@ -45,7 +45,7 @@ to obtain the script.
 
 ## Docker
 
-We also provide the docker image which installed cuttlefish debian packages
+We also provide the docker image with installed cuttlefish debian packages
 inside; including `cuttlefish-base`, `cuttlefish-user`, and
 `cuttlefish-orchestration`.
 Currently it's available for x86_64 and ARM64 architecture.
@@ -56,8 +56,8 @@ Please run below command to build manually.
 
 ```bash
 cd /path/to/android-cuttlefish
-cd docker/orchestration
-./build.sh
+cd docker
+./image-builder.sh
 ```
 
 You can validate if the docker image is successfully built by checking
@@ -71,4 +71,18 @@ cuttlefish-orchestration latest 0123456789ab   2 minutes ago    690MB
 
 ### Download prebuilt image
 
-Sorry for inconvenience, currently it's not supported yet.
+Downloading latest image is available
+[here](https://github.com/google/android-cuttlefish/actions/workflows/artifacts.yaml?query=event%3Apush).
+
+After downloading image, please load the image and verify with
+`docker image list`.
+
+```bash
+docker load --input ${PATH_TO_PREBUILT_DOCKER_IMAGE}
+```
+
+Registering the tag of loaded image as `latest` is available with below script.
+
+```bash
+docker tag cuttlefish-orchestration:${PREBUILT_DOCKER_IMAGE_TAG} cuttlefish-orchestration:latest
+```

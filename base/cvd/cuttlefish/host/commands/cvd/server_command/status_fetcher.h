@@ -18,18 +18,14 @@
 
 #include <sys/types.h>
 
-#include <mutex>
 #include <string>
 
-#include "common/libs/fs/shared_fd.h"
-#include "common/libs/utils/json.h"
 #include "common/libs/utils/result.h"
+#include "cuttlefish/host/commands/cvd/selector/cvd_persistent_data.pb.h"
 #include "host/commands/cvd/instance_manager.h"
 #include "host/commands/cvd/selector/instance_group_record.h"
 #include "host/commands/cvd/server_client.h"
 #include "host/commands/cvd/server_command/host_tool_target_manager.h"
-#include "host/commands/cvd/server_command/subprocess_waiter.h"
-#include "host/commands/cvd/types.h"
 
 namespace cuttlefish {
 
@@ -45,26 +41,19 @@ class StatusFetcher {
                 HostToolTargetManager& host_tool_target_manager)
       : instance_manager_(instance_manager),
         host_tool_target_manager_(host_tool_target_manager) {}
-  Result<void> Interrupt();
   Result<StatusFetcherOutput> FetchStatus(const RequestWithStdio&);
 
-  Result<Json::Value> FetchGroupStatus(
-      const selector::LocalInstanceGroup& group,
-      const RequestWithStdio& original_request);
+  Result<Json::Value> FetchGroupStatus(const RequestWithStdio& original_request,
+                                       selector::LocalInstanceGroup& group);
 
  private:
   Result<std::string> GetBin(const std::string& host_artifacts_path) const;
   Result<StatusFetcherOutput> FetchOneInstanceStatus(
-      const RequestWithStdio&, const InstanceManager::LocalInstanceGroup&,
-      const std::string&, const unsigned);
-
-  std::mutex interruptible_;
-  bool interrupted_ = false;
+      const RequestWithStdio&, const InstanceManager::LocalInstanceGroup& group,
+      cvd::Instance&);
 
   InstanceManager& instance_manager_;
   HostToolTargetManager& host_tool_target_manager_;
-  // needs to be exclusively owned by StatusFetcher
-  SubprocessWaiter subprocess_waiter_;
 };
 
 }  // namespace cuttlefish

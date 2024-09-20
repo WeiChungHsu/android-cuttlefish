@@ -16,38 +16,39 @@
 
 #include "host/commands/cvd/server_command/power.h"
 
-#include <android-base/strings.h>
-
 #include <functional>
-#include <iostream>
-#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include "common/libs/fs/shared_buf.h"
+#include <android-base/strings.h>
+#include <fmt/format.h>
+
 #include "common/libs/utils/contains.h"
 #include "common/libs/utils/subprocess.h"
+#include "common/libs/utils/users.h"
+#include "host/commands/cvd/common_utils.h"
 #include "host/commands/cvd/flag.h"
 #include "host/commands/cvd/selector/instance_database_types.h"
-#include "host/commands/cvd/selector/instance_group_record.h"
-#include "host/commands/cvd/selector/instance_record.h"
 #include "host/commands/cvd/selector/selector_constants.h"
 #include "host/commands/cvd/server_command/server_handler.h"
 #include "host/commands/cvd/server_command/utils.h"
 #include "host/commands/cvd/types.h"
 
 namespace cuttlefish {
+namespace {
+
+constexpr char kSummaryHelpText[] =
+    "Trigger power button event on the device, reset device to first boot "
+    "state, restart device";
 
 class CvdDevicePowerCommandHandler : public CvdServerHandler {
  public:
   CvdDevicePowerCommandHandler(HostToolTargetManager& host_tool_target_manager,
-                               InstanceManager& instance_manager,
-                               SubprocessWaiter& subprocess_waiter)
+                               InstanceManager& instance_manager)
       : host_tool_target_manager_(host_tool_target_manager),
-        instance_manager_{instance_manager},
-        subprocess_waiter_(subprocess_waiter) {
+        instance_manager_{instance_manager} {
     cvd_power_operations_["restart"] =
         [this](const std::string& android_host_out) -> Result<std::string> {
       return CF_EXPECT(RestartDeviceBin(android_host_out));
@@ -69,21 +70,19 @@ class CvdDevicePowerCommandHandler : public CvdServerHandler {
 
   Result<cvd::Response> Handle(const RequestWithStdio& request) override {
     CF_EXPECT(CanHandle(request));
-    CF_EXPECT(VerifyPrecondition(request));
-    cvd_common::Envs envs =
-        cvd_common::ConvertToEnvs(request.Message().command_request().env());
+    cvd_common::Envs envs = request.Envs();
 
     auto [op, subcmd_args] = ParseInvocation(request.Message());
     bool is_help = CF_EXPECT(IsHelp(subcmd_args));
 
     // may modify subcmd_args by consuming in parsing
     Command command =
-        is_help
-            ? CF_EXPECT(HelpCommand(request, op, subcmd_args, envs))
-            : CF_EXPECT(NonHelpCommand(request, op, subcmd_args, envs));
-    CF_EXPECT(subprocess_waiter_.Setup(command.Start()));
+        is_help ? CF_EXPECT(HelpCommand(request, op, subcmd_args, envs))
+                : CF_EXPECT(NonHelpCommand(request, op, subcmd_args, envs));
 
-    auto infop = CF_EXPECT(subprocess_waiter_.Wait());
+    siginfo_t infop;
+    command.Start().Wait(&infop, WEXITED);
+
     return ResponseFromSiginfo(infop);
   }
 
@@ -94,6 +93,21 @@ class CvdDevicePowerCommandHandler : public CvdServerHandler {
       valid_ops.push_back(op);
     }
     return valid_ops;
+  }
+
+  Result<std::string> SummaryHelp() const override { return kSummaryHelpText; }
+
+  bool ShouldInterceptHelp() const override { return false; }
+
+  Result<std::string> DetailedHelp(
+      std::vector<std::string>& arguments) const override {
+    static constexpr char kDetailedHelpText[] =
+        "Run cvd {} --help for full help text";
+    std::string replacement = "<command>";
+    if (!arguments.empty()) {
+      replacement = arguments.front();
+    }
+    return fmt::format(kDetailedHelpText, replacement);
   }
 
  private:
@@ -126,15 +140,15 @@ class CvdDevicePowerCommandHandler : public CvdServerHandler {
                               const std::string& op,
                               const cvd_common::Args& subcmd_args,
                               cvd_common::Envs envs) {
-    CF_EXPECT(Contains(envs, kAndroidHostOut));
-    const auto bin_base = CF_EXPECT(GetBin(op, envs.at(kAndroidHostOut)));
+    auto android_host_out = CF_EXPECT(AndroidHostPath(envs));
+    const auto bin_base = CF_EXPECT(GetBin(op, android_host_out));
     auto cvd_power_bin_path =
-        ConcatToString(envs.at(kAndroidHostOut), "/bin/", bin_base);
-    std::string home = Contains(envs, "HOME")
-                           ? envs.at("HOME")
-                           : CF_EXPECT(SystemWideUserHome());
+        ConcatToString(android_host_out, "/bin/", bin_base);
+    std::string home = Contains(envs, "HOME") ? envs.at("HOME")
+                                              : CF_EXPECT(SystemWideUserHome());
     envs["HOME"] = home;
-    envs[kAndroidSoongHostOut] = envs.at(kAndroidHostOut);
+    envs[kAndroidHostOut] = android_host_out;
+    envs[kAndroidSoongHostOut] = android_host_out;
     ConstructCommandParam construct_cmd_param{
         .bin_path = cvd_power_bin_path,
         .home = home,
@@ -142,9 +156,7 @@ class CvdDevicePowerCommandHandler : public CvdServerHandler {
         .envs = envs,
         .working_dir = request.Message().command_request().working_directory(),
         .command_name = bin_base,
-        .in = request.In(),
-        .out = request.Out(),
-        .err = request.Err()};
+        .null_stdio = request.IsNullIo()};
     Command command = CF_EXPECT(ConstructCommand(construct_cmd_param));
     return command;
   }
@@ -161,22 +173,19 @@ class CvdDevicePowerCommandHandler : public CvdServerHandler {
     if (instance_num_opt) {
       extra_queries.emplace_back(selector::kInstanceIdField, *instance_num_opt);
     }
-    const auto& selector_opts =
-        request.Message().command_request().selector_opts();
-    const auto selector_args = cvd_common::ConvertToArgs(selector_opts.args());
+    const auto selector_args = request.SelectorArgs();
 
-    auto instance = CF_EXPECT(instance_manager_.SelectInstance(
-        selector_args, envs, extra_queries));
-    const auto& home = instance.GroupProto().home_directory();
+    auto [instance, group] = CF_EXPECT(
+        instance_manager_.SelectInstance(selector_args, envs, extra_queries));
+    const auto& home = group.Proto().home_directory();
 
-    const auto& android_host_out = instance.GroupProto().host_artifacts_path();
+    const auto& android_host_out = group.Proto().host_artifacts_path();
     const auto bin_base = CF_EXPECT(GetBin(op, android_host_out));
     auto cvd_power_bin_path =
         ConcatToString(android_host_out, "/bin/", bin_base);
 
     cvd_common::Args cvd_env_args{subcmd_args};
-    cvd_env_args.push_back(
-        ConcatToString("--instance_num=", instance.InstanceId()));
+    cvd_env_args.push_back(ConcatToString("--instance_num=", instance.id()));
     envs["HOME"] = home;
     envs[kAndroidHostOut] = android_host_out;
     envs[kAndroidSoongHostOut] = android_host_out;
@@ -188,7 +197,7 @@ class CvdDevicePowerCommandHandler : public CvdServerHandler {
     for (const auto& arg : cvd_env_args) {
       command_to_issue << arg << " ";
     }
-    WriteAll(request.Err(), command_to_issue.str());
+    request.Err() << command_to_issue.str();
 
     ConstructCommandParam construct_cmd_param{
         .bin_path = cvd_power_bin_path,
@@ -197,9 +206,7 @@ class CvdDevicePowerCommandHandler : public CvdServerHandler {
         .envs = envs,
         .working_dir = request.Message().command_request().working_directory(),
         .command_name = bin_base,
-        .in = request.In(),
-        .out = request.Out(),
-        .err = request.Err()};
+        .null_stdio = request.IsNullIo()};
     Command command = CF_EXPECT(ConstructCommand(construct_cmd_param));
     return command;
   }
@@ -226,16 +233,17 @@ class CvdDevicePowerCommandHandler : public CvdServerHandler {
 
   HostToolTargetManager& host_tool_target_manager_;
   InstanceManager& instance_manager_;
-  SubprocessWaiter& subprocess_waiter_;
   using BinGetter = std::function<Result<std::string>(const std::string&)>;
   std::unordered_map<std::string, BinGetter> cvd_power_operations_;
 };
 
+}  // namespace
+
 std::unique_ptr<CvdServerHandler> NewCvdDevicePowerCommandHandler(
     HostToolTargetManager& host_tool_target_manager,
-    InstanceManager& instance_manager, SubprocessWaiter& subprocess_waiter) {
+    InstanceManager& instance_manager) {
   return std::unique_ptr<CvdServerHandler>(new CvdDevicePowerCommandHandler(
-      host_tool_target_manager, instance_manager, subprocess_waiter));
+      host_tool_target_manager, instance_manager));
 }
 
 }  // namespace cuttlefish

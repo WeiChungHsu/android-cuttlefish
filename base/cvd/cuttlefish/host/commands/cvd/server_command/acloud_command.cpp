@@ -16,8 +16,6 @@
 
 #include "host/commands/cvd/server_command/acloud_command.h"
 
-#include <atomic>
-#include <mutex>
 #include <thread>
 
 #include <android-base/file.h>
@@ -25,14 +23,13 @@
 
 #include "common/libs/fs/shared_buf.h"
 #include "common/libs/fs/shared_fd.h"
-#include "common/libs/utils/contains.h"
 #include "common/libs/utils/environment.h"
+#include "common/libs/utils/files.h"
 #include "common/libs/utils/result.h"
 #include "cuttlefish/host/commands/cvd/cvd_server.pb.h"
 #include "host/commands/cvd/acloud/converter.h"
 #include "host/commands/cvd/acloud/create_converter_parser.h"
 #include "host/commands/cvd/command_sequence.h"
-#include "host/commands/cvd/instance_lock.h"
 #include "host/commands/cvd/server_command/acloud_common.h"
 #include "host/commands/cvd/server_command/server_handler.h"
 #include "host/commands/cvd/server_command/utils.h"
@@ -103,24 +100,24 @@ class AcloudCommand : public CvdServerHandler {
   }
 
  private:
-  Result<cvd::InstanceGroupInfo> HandleStartResponse(
+  Result<cvd::InstanceGroupInfo> ParseStartResponse(
       const cvd::Response& start_response);
   Result<void> PrintBriefSummary(const cvd::InstanceGroupInfo& group_info,
-                                 std::optional<SharedFD> stream_fd) const;
+                                 std::ostream& out) const;
   Result<ConvertedAcloudCreateCommand> ValidateLocal(
       const RequestWithStdio& request);
   bool ValidateRemoteArgs(const RequestWithStdio& request);
   Result<cvd::Response> HandleLocal(const ConvertedAcloudCreateCommand& command,
                                     const RequestWithStdio& request);
+  Result<void> PrepareForDeleteCommand(const cvd::InstanceGroupInfo&);
   Result<cvd::Response> HandleRemote(const RequestWithStdio& request);
   Result<void> RunAcloudConnect(const RequestWithStdio& request,
                                 const std::string& hostname);
 
   CommandSequenceExecutor& executor_;
-  SubprocessWaiter waiter_;
 };
 
-Result<cvd::InstanceGroupInfo> AcloudCommand::HandleStartResponse(
+Result<cvd::InstanceGroupInfo> AcloudCommand::ParseStartResponse(
     const cvd::Response& start_response) {
   CF_EXPECT(start_response.has_command_response(),
             "cvd start did not return a command response.");
@@ -133,13 +130,7 @@ Result<cvd::InstanceGroupInfo> AcloudCommand::HandleStartResponse(
 }
 
 Result<void> AcloudCommand::PrintBriefSummary(
-    const cvd::InstanceGroupInfo& group_info,
-    std::optional<SharedFD> stream_fd) const {
-  if (!stream_fd) {
-    return {};
-  }
-  SharedFD fd = *stream_fd;
-  std::stringstream ss;
+    const cvd::InstanceGroupInfo& group_info, std::ostream& out) const {
   const std::string& group_name = group_info.group_name();
   CF_EXPECT_EQ(group_info.home_directories().size(), 1);
   const std::string home_dir = (group_info.home_directories())[0];
@@ -151,16 +142,14 @@ Result<void> AcloudCommand::PrintBriefSummary(
     instance_names.push_back(instance.name());
     instance_ids.push_back(instance.instance_id());
   }
-  ss << std::endl << "Created instance group: " << group_name << std::endl;
+  out << std::endl << "Created instance group: " << group_name << std::endl;
   for (size_t i = 0; i != instance_ids.size(); i++) {
     std::string device_name = group_name + "-" + instance_names[i];
-    ss << "  " << device_name << " (local-instance-" << instance_ids[i] << ")"
-       << std::endl;
+    out << "  " << device_name << " (local-instance-" << instance_ids[i] << ")"
+        << std::endl;
   }
-  ss << std::endl
-     << "acloud list or cvd fleet for more information." << std::endl;
-  auto n_write = WriteAll(*stream_fd, ss.str());
-  CF_EXPECT_EQ(n_write, (ssize_t)ss.str().size());
+  out << std::endl
+      << "acloud list or cvd fleet for more information." << std::endl;
   return {};
 }
 
@@ -169,9 +158,7 @@ Result<ConvertedAcloudCreateCommand> AcloudCommand::ValidateLocal(
   CF_EXPECT(CanHandle(request));
   CF_EXPECT(IsSubOperationSupported(request));
   // ConvertAcloudCreate converts acloud to cvd commands.
-  // The input parameters waiter_, cb_unlock, cb_lock are.used to
-  // support interrupt which have locking and unlocking functions
-  return acloud_impl::ConvertAcloudCreate(request, waiter_);
+  return acloud_impl::ConvertAcloudCreate(request);
 }
 
 bool AcloudCommand::ValidateRemoteArgs(const RequestWithStdio& request) {
@@ -194,23 +181,57 @@ Result<cvd::Response> AcloudCommand::HandleLocal(
               true);
   }
 
-  auto handle_response_result = HandleStartResponse(start_response);
-  if (handle_response_result.ok()) {
-    // print
-    std::optional<SharedFD> fd_opt;
-    if (command.verbose) {
-      fd_opt = request.Err();
-    }
-    auto write_result = PrintBriefSummary(*handle_response_result, fd_opt);
-    if (!write_result.ok()) {
-      LOG(ERROR) << "Failed to write the start response report.";
-    }
-  } else {
-    LOG(ERROR) << "Failed to analyze the cvd start response.";
-  }
   cvd::Response response;
   response.mutable_command_response();
+  auto group_info_result = ParseStartResponse(start_response);
+  if (!group_info_result.ok()) {
+    LOG(ERROR) << "Failed to analyze the cvd start response.";
+    return response;
+  }
+  auto prepare_delete_result = PrepareForDeleteCommand(*group_info_result);
+  if (!prepare_delete_result.ok()) {
+    LOG(ERROR) << prepare_delete_result.error().FormatForEnv();
+    LOG(WARNING) << "Failed to prepare for execution of `acloud delete`, use "
+                    "`cvd rm` instead";
+  }
+  // print
+  std::optional<SharedFD> fd_opt;
+  if (command.verbose) {
+    PrintBriefSummary(*group_info_result, request.Err());
+  }
   return response;
+}
+
+// Acloud delete is not translated because it needs to handle remote cases.
+// Python acloud implements delete by calling stop_cvd
+// This function replaces stop_cvd with a script that calls `cvd rm`, which in
+// turn calls cvd_internal_stop if necessary.
+Result<void> AcloudCommand::PrepareForDeleteCommand(
+    const cvd::InstanceGroupInfo& group_info) {
+  std::string host_path = group_info.host_artifacts_path();
+  std::string stop_cvd_path = fmt::format("{}/bin/stop_cvd", host_path);
+  std::string cvd_internal_stop_path =
+      fmt::format("{}/bin/cvd_internal_stop", host_path);
+  if (FileExists(cvd_internal_stop_path)) {
+    // cvd_internal_stop exists, stop_cvd is just a symlink to it
+    CF_EXPECT(RemoveFile(stop_cvd_path), "Failed to remove stop_cvd file");
+  } else {
+    // cvd_internal_stop doesn't exist, stop_cvd is the actual executable file
+    CF_EXPECT(RenameFile(stop_cvd_path, cvd_internal_stop_path),
+              "Failed to rename stop_cvd as cvd_internal_stop");
+  }
+  SharedFD stop_cvd_fd = SharedFD::Creat(stop_cvd_path, 0775);
+  CF_EXPECTF(stop_cvd_fd->IsOpen(), "Failed to create stop_cvd executable: {}",
+             stop_cvd_fd->StrError());
+  // Don't include the group name in the rm command, it's not needed for a
+  // single instance group and won't know which group needs to be removed if
+  // multiple groups exist. Acloud delete will set the HOME variable, which
+  // means cvd rm will pick the right group.
+  std::string stop_cvd_content =  "#!/bin/sh\ncvd rm";
+  auto ret = WriteAll(stop_cvd_fd, stop_cvd_content);
+  CF_EXPECT(ret == (ssize_t)stop_cvd_content.size(),
+            "Failed to write to stop_cvd script");
+  return {};
 }
 
 Result<cvd::Response> AcloudCommand::HandleRemote(
@@ -226,8 +247,12 @@ Result<cvd::Response> AcloudCommand::HandleRemote(
   if (args[0] == "create") {
     cmd.AddParameter("--auto_connect=false");
   }
-  cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdIn, request.In());
-  cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdErr, request.Err());
+  if (request.IsNullIo()) {
+    SharedFD null_fd = SharedFD::Open("/dev/null", O_RDWR, 0644);
+    cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdIn, null_fd);
+    cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdErr, null_fd);
+  }
+
   std::string stdout_;
   SharedFD stdout_pipe_read, stdout_pipe_write;
   CF_EXPECT(SharedFD::Pipe(&stdout_pipe_read, &stdout_pipe_write),
@@ -239,13 +264,13 @@ Result<cvd::Response> AcloudCommand::HandleRemote(
       LOG(ERROR) << "Error in reading stdout from process";
     }
   });
-  WriteAll(request.Err(),
-           "UPDATE! Try the new `cvdr` tool directly. Run `cvdr --help` to get "
-           "started.\n");
-  auto subprocess = cmd.Start();
-  CF_EXPECT(subprocess.Started());
-  CF_EXPECT(waiter_.Setup(std::move(subprocess)));
-  siginfo_t siginfo = CF_EXPECT(waiter_.Wait());
+  request.Err()
+      << "UPDATE! Try the new `cvdr` tool directly. Run `cvdr --help` to get "
+         "started.\n";
+
+  siginfo_t siginfo;
+
+  cmd.Start().Wait(&siginfo, WEXITED);
   {
     // Force the destructor to run by moving it into a smaller scope.
     // This is necessary to close the write end of the pipe.
@@ -253,7 +278,7 @@ Result<cvd::Response> AcloudCommand::HandleRemote(
   }
   stdout_pipe_write->Close();
   stdout_thread.join();
-  WriteAll(request.Out(), stdout_);
+  request.Out() << stdout_;
   if (args[0] == "create" && siginfo.si_status == EXIT_SUCCESS) {
     std::string hostname = stdout_.substr(0, stdout_.find(" "));
     CF_EXPECT(RunAcloudConnect(request, hostname));
@@ -275,13 +300,16 @@ Result<void> AcloudCommand::RunAcloudConnect(const RequestWithStdio& request,
   cmd.AddParameter("reconnect");
   cmd.AddParameter("--instance-names");
   cmd.AddParameter(hostname);
-  cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdIn, request.In());
-  cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdOut, request.Out());
-  cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdErr, request.Err());
-  auto subprocess = cmd.Start();
-  CF_EXPECT(subprocess.Started());
-  CF_EXPECT(waiter_.Setup(std::move(subprocess)));
-  CF_EXPECT(waiter_.Wait());
+
+  if (request.IsNullIo()) {
+    SharedFD null_fd = SharedFD::Open("/dev/null", O_RDWR, 0644);
+    cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdIn, null_fd);
+    cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdOut, null_fd);
+    cmd.RedirectStdIO(Subprocess::StdIOChannel::kStdErr, null_fd);
+  }
+
+  cmd.Start().Wait();
+
   return {};
 }
 

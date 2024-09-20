@@ -15,19 +15,17 @@
  */
 #include "host/commands/cvd/server_command/load_configs.h"
 
-#include <iostream>
 #include <mutex>
-#include <sstream>
+#include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
-#include "json/json.h"
-
-#include "common/libs/fs/shared_buf.h"
+#include "common/libs/utils/files.h"
 #include "common/libs/utils/result.h"
 #include "host/commands/cvd/command_sequence.h"
 #include "host/commands/cvd/common_utils.h"
+#include "host/commands/cvd/instance_manager.h"
+#include "host/commands/cvd/interrupt_listener.h"
 #include "host/commands/cvd/parser/load_configs_parser.h"
 #include "host/commands/cvd/selector/selector_constants.h"
 #include "host/commands/cvd/server_client.h"
@@ -53,11 +51,21 @@ Optionally fetches remote artifacts prior to launching the cuttlefish environmen
 The --override flag can be used to give new values for properties in the config file without needing to edit the file directly.  Convenient for one-off invocations.
 )";
 
+Result<CvdFlags> GetCvdFlags(const RequestWithStdio& request) {
+  auto args = ParseInvocation(request.Message()).arguments;
+  auto working_directory =
+      request.Message().command_request().working_directory();
+  const LoadFlags flags = CF_EXPECT(GetFlags(args, working_directory));
+  return CF_EXPECT(GetCvdFlags(flags));
+}
+
 }  // namespace
 
 class LoadConfigsCommand : public CvdServerHandler {
  public:
-  LoadConfigsCommand(CommandSequenceExecutor& executor) : executor_(executor) {}
+  LoadConfigsCommand(CommandSequenceExecutor& executor,
+                     InstanceManager& instance_manager)
+      : executor_(executor), instance_manager_(instance_manager) {}
   ~LoadConfigsCommand() = default;
 
   Result<bool> CanHandle(const RequestWithStdio& request) const override {
@@ -69,12 +77,96 @@ class LoadConfigsCommand : public CvdServerHandler {
     bool can_handle_request = CF_EXPECT(CanHandle(request));
     CF_EXPECT_EQ(can_handle_request, true);
 
-    auto commands = CF_EXPECT(CreateCommandSequence(request));
-    CF_EXPECT(executor_.Execute(commands, request.Err()));
+    auto cvd_flags = CF_EXPECT(GetCvdFlags(request));
+    std::string group_home_directory =
+        cvd_flags.load_directories.launch_home_directory;
+
+    std::mutex group_creation_mtx;
+
+    auto push_result = PushInterruptListener(
+        [this, &group_home_directory, &group_creation_mtx](int) {
+          // Creating the listener before the group exists has a very low chance
+          // that it may run before the group is actually created and fail,
+          // that's fine. The alternative is having a very low chance of being
+          // interrupted before the listener is setup and leaving the group in
+          // the wrong state in the database.
+          LOG(ERROR) << "Interrupt signal received";
+          // There is a race here if the signal arrived just before the
+          // subprocess was created. Hopefully, by aborting fast the
+          // cvd_internal_start subprocess won't have time to complete and
+          // receive the SIGHUP signal, so nothing should be left behind.
+          {
+            std::lock_guard lock(group_creation_mtx);
+            auto group_res = instance_manager_.FindGroup(
+                selector::Query(selector::kHomeField, group_home_directory));
+            if (!group_res.ok()) {
+              LOG(ERROR) << "Failed to load group from database: "
+                         << group_res.error().Message();
+              // Abort while holding the lock to prevent the group from being
+              // created if it didn't exist yet
+              std::abort();
+            }
+            auto& group = *group_res;
+            group.SetAllStates(cvd::INSTANCE_STATE_CANCELLED);
+            auto update_res = instance_manager_.UpdateInstanceGroup(group);
+            if (!update_res.ok()) {
+              LOG(ERROR) << "Failed to update groups status: "
+                         << update_res.error().Message();
+            }
+            std::abort();
+          }
+        });
+    auto listener_handle = CF_EXPECT(std::move(push_result));
+
+    group_creation_mtx.lock();
+    // Don't use CF_EXPECT here or the mutex will be left locked.
+    auto group_res = CreateGroup(cvd_flags);
+    group_creation_mtx.unlock();
+    auto group = CF_EXPECT(std::move(group_res));
+
+    auto res = LoadGroup(request, group, std::move(cvd_flags));
+    if (!res.ok()) {
+      auto first_instance_state = group.Instances()[0].state();
+      // The failure could have occurred during prepare(fetch) or start
+      auto failed_state = first_instance_state == cvd::INSTANCE_STATE_PREPARING
+                              ? cvd::INSTANCE_STATE_PREPARE_FAILED
+                              : cvd::INSTANCE_STATE_BOOT_FAILED;
+      group.SetAllStates(failed_state);
+      CF_EXPECT(instance_manager_.UpdateInstanceGroup(group));
+      CF_EXPECT(std::move(res));
+    }
+    listener_handle.reset();
 
     cvd::Response response;
     response.mutable_command_response();
     return response;
+  }
+
+  Result<void> LoadGroup(const RequestWithStdio& request,
+                         selector::LocalInstanceGroup& group,
+                         CvdFlags cvd_flags) {
+    auto mkdir_res =
+        EnsureDirectoryExists(cvd_flags.load_directories.launch_home_directory,
+                              0775, /* group_name */ "");
+    if (!mkdir_res.ok()) {
+      group.SetAllStates(cvd::INSTANCE_STATE_PREPARE_FAILED);
+      instance_manager_.UpdateInstanceGroup(group);
+    }
+    CF_EXPECT(std::move(mkdir_res));
+
+    if (!cvd_flags.fetch_cvd_flags.empty()) {
+      auto fetch_cmd = BuildFetchCmd(request, cvd_flags);
+      auto fetch_res = executor_.ExecuteOne(fetch_cmd, request.Err());
+      if (!fetch_res.ok()) {
+        group.SetAllStates(cvd::INSTANCE_STATE_PREPARE_FAILED);
+        instance_manager_.UpdateInstanceGroup(group);
+      }
+      CF_EXPECT(std::move(fetch_res));
+    }
+
+    auto launch_cmd = BuildLaunchCmd(request, cvd_flags, group);
+    CF_EXPECT(executor_.ExecuteOne(launch_cmd, request.Err()));
+    return {};
   }
 
   cvd_common::Args CmdList() const override { return {kLoadSubCmd}; }
@@ -87,38 +179,27 @@ class LoadConfigsCommand : public CvdServerHandler {
     return kDetailedHelpText;
   }
 
-  Result<std::vector<RequestWithStdio>> CreateCommandSequence(
-      const RequestWithStdio& request) {
-    auto args = ParseInvocation(request.Message()).arguments;
-    auto working_directory =
-        request.Message().command_request().working_directory();
-    const LoadFlags flags = CF_EXPECT(GetFlags(args, working_directory));
-    auto cvd_flags = CF_EXPECT(GetCvdFlags(flags));
-
-    std::vector<cvd::Request> req_protos;
-    const auto& client_env = request.Message().command_request().env();
-
-    if (!cvd_flags.fetch_cvd_flags.empty()) {
-      auto& fetch_cmd = *req_protos.emplace_back().mutable_command_request();
-      *fetch_cmd.mutable_env() = client_env;
-      fetch_cmd.add_args("cvd");
-      fetch_cmd.add_args("fetch");
-      for (const auto& flag : cvd_flags.fetch_cvd_flags) {
-        fetch_cmd.add_args(flag);
-      }
+  RequestWithStdio BuildFetchCmd(const RequestWithStdio& request,
+                                 const CvdFlags& cvd_flags) {
+    cvd::Request fetch_req;
+    auto& fetch_cmd = *fetch_req.mutable_command_request();
+    *fetch_cmd.mutable_env() = request.Message().command_request().env();
+    fetch_cmd.add_args("cvd");
+    fetch_cmd.add_args("fetch");
+    for (const auto& flag : cvd_flags.fetch_cvd_flags) {
+      fetch_cmd.add_args(flag);
     }
+    return RequestWithStdio::InheritIo(std::move(fetch_req), request);
+  }
 
-    auto& mkdir_cmd = *req_protos.emplace_back().mutable_command_request();
-    *mkdir_cmd.mutable_env() = client_env;
-    mkdir_cmd.add_args("cvd");
-    mkdir_cmd.add_args("mkdir");
-    mkdir_cmd.add_args("-p");
-    mkdir_cmd.add_args(cvd_flags.load_directories.launch_home_directory);
-
-    auto& launch_cmd = *req_protos.emplace_back().mutable_command_request();
+  RequestWithStdio BuildLaunchCmd(const RequestWithStdio& request,
+                                  const CvdFlags& cvd_flags,
+                                  const selector::LocalInstanceGroup& group) {
+    cvd::Request launch_req;
+    auto& launch_cmd = *launch_req.mutable_command_request();
     launch_cmd.set_working_directory(
         cvd_flags.load_directories.host_package_directory);
-    *launch_cmd.mutable_env() = client_env;
+    *launch_cmd.mutable_env() = request.Message().command_request().env();
     (*launch_cmd.mutable_env())["HOME"] =
         cvd_flags.load_directories.launch_home_directory;
     (*launch_cmd.mutable_env())[kAndroidHostOut] =
@@ -134,14 +215,18 @@ class LoadConfigsCommand : public CvdServerHandler {
      without question during launch)
      */
     launch_cmd.add_args("cvd");
-    launch_cmd.add_args("start");
+    // The newly created instances don't have an id yet, create will allocate
+    // those
+    launch_cmd.add_args("create");
     launch_cmd.add_args("--daemon");
 
     for (const auto& parsed_flag : cvd_flags.launch_cvd_flags) {
       launch_cmd.add_args(parsed_flag);
     }
     // Add system flag for multi-build scenario
-    launch_cmd.add_args(cvd_flags.load_directories.system_image_directory_flag);
+    launch_cmd.add_args(fmt::format(
+        "--system_image_dir={}",
+        cvd_flags.load_directories.system_image_directory_flag_value));
 
     auto selector_opts = launch_cmd.mutable_selector_opts();
 
@@ -149,26 +234,40 @@ class LoadConfigsCommand : public CvdServerHandler {
       selector_opts->add_args(flag);
     }
 
-    /*Verbose is disabled by default*/
-    std::vector<SharedFD> fds = {request.In(), request.Out(), request.Err()};
-    std::vector<RequestWithStdio> ret;
+    // Make sure the newly created group is used by cvd create
+    launch_cmd.mutable_selector_opts()->add_args("--group_name");
+    launch_cmd.mutable_selector_opts()->add_args(group.GroupName());
 
-    for (auto& request_proto : req_protos) {
-      ret.emplace_back(RequestWithStdio(request_proto, fds));
-    }
-
-    return ret;
+    return RequestWithStdio::InheritIo(std::move(launch_req), request);
   }
 
  private:
+  Result<selector::LocalInstanceGroup> CreateGroup(const CvdFlags& cvd_flags) {
+    selector::GroupCreationInfo group_info{
+        .home = cvd_flags.load_directories.launch_home_directory,
+        .host_artifacts_path =
+            cvd_flags.load_directories.host_package_directory,
+        .product_out_path =
+            cvd_flags.load_directories.system_image_directory_flag_value,
+        .group_name = cvd_flags.group_name ? *cvd_flags.group_name : "",
+    };
+    for (const auto& instance_name : cvd_flags.instance_names) {
+      group_info.instances.emplace_back(0, instance_name,
+                                        cvd::INSTANCE_STATE_PREPARING);
+    }
+    return CF_EXPECT(instance_manager_.CreateInstanceGroup(group_info));
+  }
+
   static constexpr char kLoadSubCmd[] = "load";
 
   CommandSequenceExecutor& executor_;
+  InstanceManager& instance_manager_;
 };
 
 std::unique_ptr<CvdServerHandler> NewLoadConfigsCommand(
-    CommandSequenceExecutor& executor) {
-  return std::unique_ptr<CvdServerHandler>(new LoadConfigsCommand(executor));
+    CommandSequenceExecutor& executor, InstanceManager& instance_manager) {
+  return std::unique_ptr<CvdServerHandler>(
+      new LoadConfigsCommand(executor, instance_manager));
 }
 
 }  // namespace cuttlefish

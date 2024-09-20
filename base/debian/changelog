@@ -1,19 +1,56 @@
-cuttlefish-common (0.9.29) UNRELEASED; urgency=medium
+cuttlefish-common (1.0.0) UNRELEASED; urgency=medium
+
+  [ Jorge E. Moreira ]
+  * Delete unused experimental commands
+
+ -- Jorge Moreira <jemoreira@google.com>  Thu, 05 Sep 2024 11:05:25 -0700
+
+cuttlefish-common (0.9.31) unstable; urgency=medium
+
+  [ Chad Reynolds ]
+  * Help command improvements
+
+  [ Jorge E. Moreira ]
+  * cvd continues to track instances after stop or failure
+  * Split cvd start into create and start
+  * Introduce cvd remove command
+  * cvd start and remove use group selection menu
+  * cvd pre-registers devices with operator
+
+ -- Jorge Moreira <jemoreira@google.com>  Mon, 12 Aug 2024 16:47:44 -0700
+
+cuttlefish-common (0.9.30) stable; urgency=medium
+
+  [ Chad Reynolds ]
+  [Jorge E. Moreira]
+  * Use iptables when iptables-legacy is not available
+  * Cvd instances stored in databasse during preparation stage
+
+  [A. Cody Schuffelen]
+  * Improvements to fetch_cvd
+
+  [Chad Reynolds]
+  * Download artifacts to temporary file first
+
+ -- Jorge Moreira <jemoreira@google.com>  Mon, 29 Jul 2024 15:44:02 -0700
+
+cuttlefish-common (0.9.29) stable; urgency=medium
 
   [ A. Cody Schuffelen ]
   * Add capability to `cvd fetch` to download ChromeOS builds
 
   [ Chad Reynolds ]
   * Always attempt to fetch full set of system images
+  * Add `cvd fetch` temporary caching for downloaded artifacts
 
   [ Jorge E. Moreira ]
   * Execute cvd commands in-process, without a cvd server
   * Build cvd with bazel
   * Return group information from cvd start
 
- -- Chad Reynolds <chadreynolds@google.com>  Mon, 22 Apr 2024 15:56:40 -0700
+ -- Chad Reynolds <chadreynolds@google.com>  Thu, 06 Jun 2024 16:38:42 -0700
 
-cuttlefish-common (0.9.28) unstable; urgency=medium
+cuttlefish-common (0.9.28) stable; urgency=medium
 
   * Other bug fixes
 
@@ -25,7 +62,7 @@ cuttlefish-common (0.9.28) unstable; urgency=medium
 
  -- Jorge E. Moreira <jemoreira@google.com>  Wed, 31 Jan 2024 11:40:30 -0700
 
-cuttlefish-common (0.9.27) unstable; urgency=medium
+cuttlefish-common (0.9.27) stable; urgency=medium
 
   * Increase nofile soft limit to support passthrough GPU modes
 

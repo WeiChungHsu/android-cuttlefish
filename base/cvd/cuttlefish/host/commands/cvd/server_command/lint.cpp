@@ -16,21 +16,12 @@
 
 #include "host/commands/cvd/server_command/lint.h"
 
-#include <iostream>
 #include <memory>
-#include <sstream>
 #include <string>
-#include <string_view>
 #include <vector>
 
-#include "json/json.h"
-
-#include "common/libs/fs/shared_buf.h"
 #include "common/libs/utils/result.h"
-#include "host/commands/cvd/command_sequence.h"
-#include "host/commands/cvd/common_utils.h"
 #include "host/commands/cvd/parser/load_configs_parser.h"
-#include "host/commands/cvd/selector/selector_constants.h"
 #include "host/commands/cvd/server_client.h"
 #include "host/commands/cvd/server_command/server_handler.h"
 #include "host/commands/cvd/server_command/utils.h"
@@ -55,7 +46,7 @@ class LintCommandHandler : public CvdServerHandler {
  public:
   LintCommandHandler() {}
 
-  Result<bool> CanHandle(const RequestWithStdio& request) const {
+  Result<bool> CanHandle(const RequestWithStdio& request) const override {
     auto invocation = ParseInvocation(request.Message());
     return invocation.command == kLintSubCmd;
   }
@@ -68,12 +59,9 @@ class LintCommandHandler : public CvdServerHandler {
         request.Message().command_request().working_directory();
     const auto config_path = CF_EXPECT(ValidateConfig(args, working_directory));
 
-    std::stringstream message_stream;
-    message_stream << "Lint of flags and config \"" << config_path
-                   << "\" succeeded\n";
-    const auto message = message_stream.str();
-    CF_EXPECT_EQ(WriteAll(request.Out(), message), (ssize_t)message.size(),
-                 "Error writing message");
+    request.Out() << "Lint of flags and config \"" << config_path
+                  << "\" succeeded\n";
+
     cvd::Response response;
     response.mutable_command_response();
     response.mutable_status()->set_code(cvd::Status::OK);

@@ -19,33 +19,29 @@
 #include <sys/types.h>
 
 #include <optional>
-#include <set>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common/libs/fs/shared_fd.h"
-#include "common/libs/utils/json.h"
 #include "common/libs/utils/result.h"
 #include "cuttlefish/host/commands/cvd/cvd_server.pb.h"
-#include "host/commands/cvd/common_utils.h"
+#include "cuttlefish/host/commands/cvd/selector/cvd_persistent_data.pb.h"
 #include "host/commands/cvd/instance_lock.h"
 #include "host/commands/cvd/selector/creation_analyzer.h"
 #include "host/commands/cvd/selector/group_selector.h"
 #include "host/commands/cvd/selector/instance_database.h"
 #include "host/commands/cvd/selector/instance_database_types.h"
 #include "host/commands/cvd/selector/instance_selector.h"
+#include "host/commands/cvd/server_client.h"
 #include "host/commands/cvd/server_command/host_tool_target_manager.h"
 
 namespace cuttlefish {
 
 class InstanceManager {
  public:
-  using CreationAnalyzer = selector::CreationAnalyzer;
-  using CreationAnalyzerParam = CreationAnalyzer::CreationAnalyzerParam;
   using GroupCreationInfo = selector::GroupCreationInfo;
   using LocalInstanceGroup = selector::LocalInstanceGroup;
-  using LocalInstance = selector::LocalInstance;
   using GroupSelector = selector::GroupSelector;
   using InstanceSelector = selector::InstanceSelector;
   using Queries = selector::Queries;
@@ -57,21 +53,26 @@ class InstanceManager {
                   selector::InstanceDatabase& instance_db);
 
   // For cvd start
-  Result<GroupCreationInfo> Analyze(const CreationAnalyzerParam& param);
+  Result<selector::CreationAnalyzer> CreationAnalyzer(
+      const selector::CreationAnalyzer::CreationAnalyzerParam& param);
 
   Result<LocalInstanceGroup> SelectGroup(const cvd_common::Args& selector_args,
                                          const cvd_common::Envs& envs,
                                          const Queries& extra_queries = {});
 
-  Result<LocalInstance> SelectInstance(
+  Result<std::pair<cvd::Instance, LocalInstanceGroup>> SelectInstance(
       const cvd_common::Args& selector_args, const cvd_common::Envs& envs,
       const Queries& extra_queries = {});
 
   Result<bool> HasInstanceGroups();
-  Result<void> SetInstanceGroup(const selector::GroupCreationInfo& group_info);
-  Result<bool> RemoveInstanceGroup(const std::string&);
+  Result<LocalInstanceGroup> CreateInstanceGroup(
+      const selector::GroupCreationInfo& group_info);
+  Result<void> UpdateInstanceGroup(const LocalInstanceGroup& group);
+  Result<void> UpdateInstance(const LocalInstanceGroup& group,
+                              const cvd::Instance& instance);
+  Result<bool> RemoveInstanceGroupByHome(const std::string&);
 
-  cvd::Status CvdClear(const SharedFD& out, const SharedFD& err);
+  cvd::Status CvdClear(const RequestWithStdio&);
   static Result<std::string> GetCuttlefishConfigPath(const std::string& home);
 
   Result<std::optional<InstanceLockFile>> TryAcquireLock(int instance_num);
@@ -79,11 +80,6 @@ class InstanceManager {
   Result<std::vector<LocalInstanceGroup>> FindGroups(const Query& query) const;
   Result<std::vector<LocalInstanceGroup>> FindGroups(
       const Queries& queries) const;
-  Result<std::vector<LocalInstance>> FindInstances(
-      const Query& query) const;
-  Result<std::vector<LocalInstance>> FindInstances(
-      const Queries& queries) const;
-
   Result<LocalInstanceGroup> FindGroup(const Query& query) const;
   Result<LocalInstanceGroup> FindGroup(const Queries& queries) const;
   Result<void> LoadFromJson(const Json::Value&);
@@ -91,19 +87,11 @@ class InstanceManager {
   Result<void> SetAcloudTranslatorOptout(bool optout);
   Result<bool> GetAcloudTranslatorOptout() const;
 
-  struct UserGroupSelectionSummary {
-    // Index to group name. This is the index printed in the menu
-    // This field offers mapping between the number/index the user
-    // selects and the group that is to be chosen
-    std::unordered_map<int, std::string> idx_to_group_name;
-    std::string menu;
-  };
-  Result<UserGroupSelectionSummary> GroupSummaryMenu() const;
+  Result<void> IssueStopCommand(const RequestWithStdio& request,
+                                const std::string& config_file_path,
+                                selector::LocalInstanceGroup& group);
 
  private:
-  Result<void> IssueStopCommand(const SharedFD& out, const SharedFD& err,
-                                const std::string& config_file_path,
-                                const selector::LocalInstanceGroup& group);
   Result<std::string> StopBin(const std::string& host_android_out);
 
   InstanceLockFileManager& lock_manager_;

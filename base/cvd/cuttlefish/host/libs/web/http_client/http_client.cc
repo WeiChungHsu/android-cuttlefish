@@ -17,10 +17,10 @@
 
 #include <stdio.h>
 
-#include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
-#include <regex>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -31,6 +31,9 @@
 #include <curl/curl.h>
 #include <json/json.h>
 
+#include "common/libs/fs/shared_fd.h"
+#include "common/libs/fs/shared_fd_stream.h"
+#include "common/libs/utils/files.h"
 #include "common/libs/utils/json.h"
 #include "common/libs/utils/subprocess.h"
 #include "host/libs/web/http_client/http_client_util.h"
@@ -160,29 +163,31 @@ class CurlClient : public HttpClient {
 
   Result<HttpResponse<void>> DownloadToCallback(
       DataCallback callback, const std::string& url,
-      const std::vector<std::string>& headers) {
+      const std::vector<std::string>& headers) override {
     return DownloadToCallback(HttpMethod::kGet, callback, url, headers);
   }
 
   Result<HttpResponse<std::string>> DownloadToFile(
       const std::string& url, const std::string& path,
-      const std::vector<std::string>& headers) {
+      const std::vector<std::string>& headers) override {
     LOG(INFO) << "Attempting to save \"" << url << "\" to \"" << path << "\"";
-    std::fstream stream;
-    auto callback = [&stream, path](char* data, size_t size) -> bool {
+
+    auto [shared_fd, temp_path] = CF_EXPECT(SharedFD::Mkostemp(path));
+    SharedFDOstream stream(shared_fd);
+    auto callback = [&stream](char* data, size_t size) -> bool {
       if (data == nullptr) {
-        stream.open(path, std::ios::out | std::ios::binary | std::ios::trunc);
         return !stream.fail();
       }
       stream.write(data, size);
       return !stream.fail();
     };
     auto http_response = CF_EXPECT(DownloadToCallback(callback, url, headers));
+    CF_EXPECT(RenameFile(temp_path, path));
     return HttpResponse<std::string>{path, http_response.http_code};
   }
 
   Result<HttpResponse<Json::Value>> DownloadToJson(
-      const std::string& url, const std::vector<std::string>& headers) {
+      const std::string& url, const std::vector<std::string>& headers) override {
     return DownloadToJson(HttpMethod::kGet, url, headers);
   }
 
@@ -316,7 +321,7 @@ class ServerErrorRetryClient : public HttpClient {
         retry_delay_(retry_delay) {}
 
   Result<HttpResponse<std::string>> GetToString(
-      const std::string& url, const std::vector<std::string>& headers) {
+      const std::string& url, const std::vector<std::string>& headers) override {
     auto fn = [&, this]() { return inner_client_.GetToString(url, headers); };
     return CF_EXPECT(RetryImpl<std::string>(fn));
   }
@@ -331,7 +336,7 @@ class ServerErrorRetryClient : public HttpClient {
   }
 
   Result<HttpResponse<std::string>> DeleteToString(
-      const std::string& url, const std::vector<std::string>& headers) {
+      const std::string& url, const std::vector<std::string>& headers) override {
     auto fn = [&, this]() {
       return inner_client_.DeleteToString(url, headers);
     };
@@ -358,7 +363,7 @@ class ServerErrorRetryClient : public HttpClient {
 
   Result<HttpResponse<std::string>> DownloadToFile(
       const std::string& url, const std::string& path,
-      const std::vector<std::string>& headers) {
+      const std::vector<std::string>& headers) override {
     auto fn = [&, this]() {
       return inner_client_.DownloadToFile(url, path, headers);
     };
@@ -366,7 +371,7 @@ class ServerErrorRetryClient : public HttpClient {
   }
 
   Result<HttpResponse<Json::Value>> DownloadToJson(
-      const std::string& url, const std::vector<std::string>& headers) {
+      const std::string& url, const std::vector<std::string>& headers) override {
     auto fn = [&, this]() {
       return inner_client_.DownloadToJson(url, headers);
     };

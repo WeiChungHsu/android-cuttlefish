@@ -18,11 +18,10 @@
 
 #include <android-base/strings.h>
 
-#include "common/libs/fs/shared_buf.h"
-#include "common/libs/fs/shared_fd.h"
 #include "common/libs/utils/contains.h"
 #include "common/libs/utils/result.h"
 #include "common/libs/utils/subprocess.h"
+#include "host/commands/cvd/fetch/fetch_cvd.h"
 #include "host/commands/cvd/server_command/server_handler.h"
 #include "host/commands/cvd/server_command/utils.h"
 #include "host/commands/cvd/types.h"
@@ -31,9 +30,8 @@ namespace cuttlefish {
 
 class CvdFetchCommandHandler : public CvdServerHandler {
  public:
-  CvdFetchCommandHandler(SubprocessWaiter& subprocess_waiter)
-      : subprocess_waiter_(subprocess_waiter),
-        fetch_cmd_list_{std::vector<std::string>{"fetch", "fetch_cvd"}} {}
+  CvdFetchCommandHandler()
+      : fetch_cmd_list_{std::vector<std::string>{"fetch", "fetch_cvd"}} {}
 
   Result<bool> CanHandle(const RequestWithStdio& request) const override;
   Result<cvd::Response> Handle(const RequestWithStdio& request) override;
@@ -43,7 +41,6 @@ class CvdFetchCommandHandler : public CvdServerHandler {
   Result<std::string> DetailedHelp(std::vector<std::string>&) const override;
 
  private:
-  SubprocessWaiter& subprocess_waiter_;
   std::vector<std::string> fetch_cmd_list_;
 };
 
@@ -57,44 +54,24 @@ Result<cvd::Response> CvdFetchCommandHandler::Handle(
     const RequestWithStdio& request) {
   CF_EXPECT(CanHandle(request));
 
-  Command command("/proc/self/exe");
-  command.SetName("fetch_cvd");
-  command.SetExecutable("/proc/self/exe");
+  std::vector<std::string> args;
+  args.emplace_back("fetch_cvd");
 
   for (const auto& argument : ParseInvocation(request.Message()).arguments) {
-    command.AddParameter(argument);
+    args.emplace_back(argument);
   }
 
-  command.RedirectStdIO(Subprocess::StdIOChannel::kStdIn, request.In());
-  command.RedirectStdIO(Subprocess::StdIOChannel::kStdOut, request.Out());
-  command.RedirectStdIO(Subprocess::StdIOChannel::kStdErr, request.Err());
-  SubprocessOptions options;
-
-  const auto& command_request = request.Message().command_request();
-  if (command_request.wait_behavior() == cvd::WAIT_BEHAVIOR_START) {
-    options.ExitWithParent(false);
+  std::vector<char*> args_data;
+  for (auto& argument : args) {
+    args_data.emplace_back(argument.data());
   }
 
-  const auto& working_dir = command_request.working_directory();
-  if (!working_dir.empty()) {
-    auto fd = SharedFD::Open(working_dir, O_RDONLY | O_PATH | O_DIRECTORY);
-    if (fd->IsOpen()) {
-      command.SetWorkingDirectory(fd);
-    }
-  }
+  CF_EXPECT(FetchCvdMain(args_data.size(), args_data.data()));
 
-  CF_EXPECT(subprocess_waiter_.Setup(command.Start(std::move(options))));
-
-  if (command_request.wait_behavior() == cvd::WAIT_BEHAVIOR_START) {
-    cvd::Response response;
-    response.mutable_command_response();
-    response.mutable_status()->set_code(cvd::Status::OK);
-    return response;
-  }
-
-  auto infop = CF_EXPECT(subprocess_waiter_.Wait());
-
-  return ResponseFromSiginfo(infop);
+  cvd::Response response;
+  response.mutable_command_response();
+  response.mutable_status()->set_code(cvd::Status::OK);
+  return response;
 }
 
 Result<std::string> CvdFetchCommandHandler::SummaryHelp() const {
@@ -113,10 +90,8 @@ Result<std::string> CvdFetchCommandHandler::DetailedHelp(
   return output;
 }
 
-std::unique_ptr<CvdServerHandler> NewCvdFetchCommandHandler(
-    SubprocessWaiter& subprocess_waiter) {
-  return std::unique_ptr<CvdServerHandler>(
-      new CvdFetchCommandHandler(subprocess_waiter));
+std::unique_ptr<CvdServerHandler> NewCvdFetchCommandHandler() {
+  return std::unique_ptr<CvdServerHandler>(new CvdFetchCommandHandler());
 }
 
 }  // namespace cuttlefish

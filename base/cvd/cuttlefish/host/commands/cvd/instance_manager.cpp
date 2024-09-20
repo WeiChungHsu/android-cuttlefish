@@ -18,30 +18,26 @@
 
 #include <signal.h>
 
-#include <map>
-#include <mutex>
 #include <sstream>
 
 #include <android-base/file.h>
 #include <android-base/scopeguard.h>
+#include <android-base/strings.h>
 #include <fmt/format.h>
 #include "json/json.h"
 
 #include "common/libs/fs/shared_buf.h"
 #include "common/libs/fs/shared_fd.h"
-#include "common/libs/utils/contains.h"
 #include "common/libs/utils/files.h"
-#include "common/libs/utils/flag_parser.h"
 #include "common/libs/utils/result.h"
 #include "common/libs/utils/subprocess.h"
 #include "cuttlefish/host/commands/cvd/cvd_server.pb.h"
-#include "host/commands/cvd/common_utils.h"
 #include "host/commands/cvd/selector/instance_database_types.h"
 #include "host/commands/cvd/selector/instance_database_utils.h"
 #include "host/commands/cvd/selector/selector_constants.h"
-#include "host/commands/cvd/server_constants.h"
 #include "host/libs/config/config_constants.h"
 #include "host/libs/config/config_utils.h"
+#include "host/commands/cvd/common_utils.h"
 
 namespace cuttlefish {
 namespace {
@@ -54,6 +50,20 @@ Result<void> RunCommand(Command&& command) {
   auto result = subprocess.Wait(&infop, WEXITED);
   CF_EXPECT(result != -1, "Lost track of subprocess pid");
   CF_EXPECT(infop.si_code == CLD_EXITED && infop.si_status == 0);
+  return {};
+}
+
+Result<void> RemoveGroupDirectory(const selector::LocalInstanceGroup& group) {
+  std::string per_user_dir = PerUserDir();
+  if (!android::base::StartsWith(group.HomeDir(), per_user_dir)) {
+    LOG(WARNING)
+        << "Instance group home directory not under user specific directory("
+        << per_user_dir << "), artifacts not deleted";
+    return {};
+  }
+  CF_EXPECT(
+      RecursivelyRemoveDirectory(CF_EXPECT(GroupDirFromHome(group.HomeDir()))),
+      "Failed to remove group directory");
   return {};
 }
 
@@ -86,9 +96,9 @@ Result<bool> InstanceManager::GetAcloudTranslatorOptout() const {
   return CF_EXPECT(instance_db_.GetAcloudTranslatorOptout());
 }
 
-Result<InstanceManager::GroupCreationInfo> InstanceManager::Analyze(
-    const CreationAnalyzerParam& param) {
-  return CF_EXPECT(CreationAnalyzer::Analyze(param, lock_manager_));
+Result<selector::CreationAnalyzer> InstanceManager::CreationAnalyzer(
+    const selector::CreationAnalyzer::CreationAnalyzerParam& param) {
+  return selector::CreationAnalyzer::Create(param, lock_manager_);
 }
 
 Result<InstanceManager::LocalInstanceGroup> InstanceManager::SelectGroup(
@@ -99,43 +109,53 @@ Result<InstanceManager::LocalInstanceGroup> InstanceManager::SelectGroup(
   return CF_EXPECT(group_selector.FindGroup(instance_db_));
 }
 
-Result<InstanceManager::LocalInstance> InstanceManager::SelectInstance(
-    const cvd_common::Args& selector_args, const cvd_common::Envs& envs,
-    const Queries& extra_queries) {
+Result<std::pair<cvd::Instance, selector::LocalInstanceGroup>>
+InstanceManager::SelectInstance(const cvd_common::Args& selector_args,
+                                const cvd_common::Envs& envs,
+                                const Queries& extra_queries) {
   auto instance_selector = CF_EXPECT(
       InstanceSelector::GetSelector(selector_args, extra_queries, envs));
-  return CF_EXPECT(instance_selector.FindInstance(instance_db_));
+  return CF_EXPECT(instance_selector.FindInstanceWithGroup(instance_db_));
 }
 
 Result<bool> InstanceManager::HasInstanceGroups() {
   return !CF_EXPECT(instance_db_.IsEmpty());
 }
 
-Result<void> InstanceManager::SetInstanceGroup(
+Result<InstanceManager::LocalInstanceGroup>
+InstanceManager::CreateInstanceGroup(
     const selector::GroupCreationInfo& group_info) {
-  const auto group_name = group_info.group_name;
-  const auto home_dir = group_info.home;
-  const auto host_artifacts_path = group_info.host_artifacts_path;
-  const auto product_out_path = group_info.product_out_path;
-  const auto& per_instance_info = group_info.instances;
   cvd::InstanceGroup new_group;
-  new_group.set_name(group_name);
-  new_group.set_home_directory(home_dir);
-  new_group.set_host_artifacts_path(host_artifacts_path);
-  new_group.set_product_out_path(product_out_path);
-  new_group.set_start_time_sec(
-      selector::CvdServerClock::to_time_t(selector::CvdServerClock::now()));
-  for (const auto& instance : per_instance_info) {
+  new_group.set_name(group_info.group_name);
+  new_group.set_home_directory(group_info.home);
+  new_group.set_host_artifacts_path(group_info.host_artifacts_path);
+  new_group.set_product_out_path(group_info.product_out_path);
+  for (const auto& instance : group_info.instances) {
     auto& new_instance = *new_group.add_instances();
     new_instance.set_id(instance.instance_id_);
     new_instance.set_name(instance.per_instance_name_);
+    new_instance.set_state(instance.initial_state_);
   }
-  CF_EXPECT(instance_db_.AddInstanceGroup(new_group));
-  return {};
+  return CF_EXPECT(instance_db_.AddInstanceGroup(new_group));
 }
 
-Result<bool> InstanceManager::RemoveInstanceGroup(const std::string& dir) {
-  auto group = CF_EXPECT(instance_db_.FindGroup({selector::kHomeField, dir}));
+Result<bool> InstanceManager::RemoveInstanceGroupByHome(const std::string& dir) {
+  LocalInstanceGroup group =
+      CF_EXPECT(instance_db_.FindGroup({selector::kHomeField, dir}));
+  CF_EXPECT(!group.HasActiveInstances(),
+            "Group still contains active instances");
+  for (auto& instance: group.Instances()) {
+    if (instance.id() == 0) {
+      continue;
+    }
+    auto remove_res = lock_manager_.RemoveLockFile(instance.id());
+    if (!remove_res.ok()) {
+      LOG(ERROR) << "Failed to remove instance id lock: "
+                 << remove_res.error().FormatForEnv();
+    }
+  }
+  CF_EXPECT(RemoveGroupDirectory(group));
+
   return CF_EXPECT(instance_db_.RemoveInstanceGroup(group.GroupName()));
 }
 
@@ -147,15 +167,30 @@ Result<std::string> InstanceManager::StopBin(
   }));
 }
 
+Result<void> InstanceManager::UpdateInstanceGroup(const LocalInstanceGroup& group) {
+  CF_EXPECT(instance_db_.UpdateInstanceGroup(group));
+  return {};
+}
+
+Result<void> InstanceManager::UpdateInstance(const LocalInstanceGroup& group,
+                                             const cvd::Instance& instance) {
+  CF_EXPECT(instance_db_.UpdateInstance(group, instance));
+  return {};
+}
+
 Result<void> InstanceManager::IssueStopCommand(
-    const SharedFD& out, const SharedFD& err,
-    const std::string& config_file_path,
-    const selector::LocalInstanceGroup& group) {
+    const RequestWithStdio& request, const std::string& config_file_path,
+    selector::LocalInstanceGroup& group) {
+  SharedFD null_fd = SharedFD::Open("/dev/null", O_RDWR);
+
   const auto stop_bin = CF_EXPECT(StopBin(group.HostArtifactsPath()));
   Command command(group.HostArtifactsPath() + "/bin/" + stop_bin);
   command.AddParameter("--clear_instance_dirs");
-  command.RedirectStdIO(Subprocess::StdIOChannel::kStdOut, out);
-  command.RedirectStdIO(Subprocess::StdIOChannel::kStdErr, err);
+  if (request.IsNullIo()) {
+    command.RedirectStdIO(Subprocess::StdIOChannel::kStdIn, null_fd);
+    command.RedirectStdIO(Subprocess::StdIOChannel::kStdOut, null_fd);
+    command.RedirectStdIO(Subprocess::StdIOChannel::kStdErr, null_fd);
+  }
   command.AddEnvironmentVariable(kCuttlefishConfigEnvVarName, config_file_path);
   auto wait_result = RunCommand(std::move(command));
   /**
@@ -165,63 +200,82 @@ Result<void> InstanceManager::IssueStopCommand(
    */
   if (!wait_result.ok()) {
     std::stringstream error_msg;
-    error_msg << stop_bin << " was executed internally, and failed. It might "
-              << "be failing to parse the new --clear_instance_dirs. Will try "
-              << "without the flag.\n";
-    WriteAll(err, error_msg.str());
+    request.Out()
+        << stop_bin << " was executed internally, and failed. It might "
+        << "be failing to parse the new --clear_instance_dirs. Will try "
+        << "without the flag.\n";
     Command no_clear_instance_dir_command(group.HostArtifactsPath() + "/bin/" +
                                           stop_bin);
-    no_clear_instance_dir_command.RedirectStdIO(
-        Subprocess::StdIOChannel::kStdOut, out);
-    no_clear_instance_dir_command.RedirectStdIO(
-        Subprocess::StdIOChannel::kStdErr, err);
-    no_clear_instance_dir_command.AddEnvironmentVariable(
-        kCuttlefishConfigEnvVarName, config_file_path);
+    if (request.IsNullIo()) {
+      no_clear_instance_dir_command.RedirectStdIO(
+          Subprocess::StdIOChannel::kStdIn, null_fd);
+      no_clear_instance_dir_command.RedirectStdIO(
+          Subprocess::StdIOChannel::kStdOut, null_fd);
+      no_clear_instance_dir_command.RedirectStdIO(
+          Subprocess::StdIOChannel::kStdErr, null_fd);
+      no_clear_instance_dir_command.AddEnvironmentVariable(
+          kCuttlefishConfigEnvVarName, config_file_path);
+    }
     wait_result = RunCommand(std::move(no_clear_instance_dir_command));
   }
 
   if (!wait_result.ok()) {
-    WriteAll(err,
-             "Warning: error stopping instances for dir \"" + group.HomeDir() +
-                 "\".\nThis can happen if instances are already stopped.\n");
+    request.Err()
+        << "Warning: error stopping instances for dir \"" + group.HomeDir() +
+               "\".\nThis can happen if instances are already stopped.\n";
   }
+  group.SetAllStates(cvd::INSTANCE_STATE_STOPPED);
+  instance_db_.UpdateInstanceGroup(group);
   for (const auto& instance : group.Instances()) {
-    auto lock = lock_manager_.TryAcquireLock(instance.InstanceId());
+    auto lock = lock_manager_.TryAcquireLock(instance.id());
     if (lock.ok() && (*lock)) {
       (*lock)->Status(InUseState::kNotInUse);
       continue;
     }
-    WriteAll(err, "InstanceLockFileManager failed to acquire lock");
+    request.Err() << "InstanceLockFileManager failed to acquire lock";
   }
   return {};
 }
 
-cvd::Status InstanceManager::CvdClear(const SharedFD& out,
-                                      const SharedFD& err) {
+cvd::Status InstanceManager::CvdClear(const RequestWithStdio& request) {
   cvd::Status status;
   const std::string config_json_name = cpp_basename(GetGlobalConfigFileLink());
   auto instance_groups_res = instance_db_.Clear();
   if (!instance_groups_res.ok()) {
-    WriteAll(err, fmt::format("Failed to clear instance database: {}",
-                              instance_groups_res.error().Message()));
+    fmt::print(request.Err(), "Failed to clear instance database: {}",
+               instance_groups_res.error().Message());
     status.set_code(cvd::Status::INTERNAL);
     return status;
   }
   auto instance_groups = *instance_groups_res;
-  for (const auto& group : instance_groups) {
-    auto config_path = selector::GetCuttlefishConfigPath(group.HomeDir());
-    if (config_path.ok()) {
-      auto stop_result = IssueStopCommand(out, err, *config_path, group);
-      if (!stop_result.ok()) {
-        LOG(ERROR) << stop_result.error().FormatForEnv();
+  for (auto& group : instance_groups) {
+    // Only stop running instances.
+    if (group.HasActiveInstances()) {
+      auto config_path = selector::GetCuttlefishConfigPath(group.HomeDir());
+      if (config_path.ok()) {
+        auto stop_result = IssueStopCommand(request, *config_path, group);
+        if (!stop_result.ok()) {
+          LOG(ERROR) << stop_result.error().FormatForEnv();
+        }
+      }
+    }
+    for (auto instance: group.Instances()) {
+      if (instance.id() <= 0) {
+        continue;
+      }
+      auto res = lock_manager_.RemoveLockFile(instance.id());
+      if (!res.ok()) {
+        LOG(ERROR) << "Failed to remove lock file for instance: "
+                   << res.error().FormatForEnv();
       }
     }
     RemoveFile(group.HomeDir() + "/cuttlefish_runtime");
     RemoveFile(group.HomeDir() + config_json_name);
+    RemoveGroupDirectory(group);
   }
   // TODO(kwstephenkim): we need a better mechanism to make sure that
   // we clear all run_cvd processes.
-  WriteAll(err, "Stopped all known instances\n");
+  request.Err() << "Stopped all known instances\n";
   status.set_code(cvd::Status::OK);
   return status;
 }
@@ -241,16 +295,6 @@ InstanceManager::FindGroups(const Queries& queries) const {
   return instance_db_.FindGroups(queries);
 }
 
-Result<std::vector<InstanceManager::LocalInstance>>
-InstanceManager::FindInstances(const Query& query) const {
-  return CF_EXPECT(FindInstances(Queries{query}));
-}
-
-Result<std::vector<InstanceManager::LocalInstance>>
-InstanceManager::FindInstances(const Queries& queries) const {
-  return instance_db_.FindInstances(queries);
-}
-
 Result<InstanceManager::LocalInstanceGroup> InstanceManager::FindGroup(
     const Query& query) const {
   return CF_EXPECT(FindGroup(Queries{query}));
@@ -261,32 +305,6 @@ Result<InstanceManager::LocalInstanceGroup> InstanceManager::FindGroup(
   auto output = CF_EXPECT(instance_db_.FindGroups(queries));
   CF_EXPECT_EQ(output.size(), 1ul);
   return *(output.begin());
-}
-
-Result<InstanceManager::UserGroupSelectionSummary>
-InstanceManager::GroupSummaryMenu() const {
-  UserGroupSelectionSummary summary;
-
-  // List of Cuttlefish Instance Groups:
-  //   [i] : group_name (created: TIME)
-  //      <a> instance0.device_name() (id: instance_id)
-  //      <b> instance1.device_name() (id: instance_id)
-  std::stringstream ss;
-  ss << "List of Cuttlefish Instance Groups:" << std::endl;
-  int group_idx = 0;
-  for (const auto& group : CF_EXPECT(instance_db_.InstanceGroups())) {
-    fmt::print(ss, "  [{}] : {} (created: {})\n", group_idx, group.GroupName(),
-               selector::Format(group.StartTime()));
-    summary.idx_to_group_name[group_idx] = group.GroupName();
-    char instance_idx = 'a';
-    for (const auto& instance : group.Instances()) {
-      fmt::print(ss, "    <{}> {} (id : {})\n", instance_idx++,
-                 instance.DeviceName(), instance.InstanceId());
-    }
-    group_idx++;
-  }
-  summary.menu = ss.str();
-  return summary;
 }
 
 }  // namespace cuttlefish

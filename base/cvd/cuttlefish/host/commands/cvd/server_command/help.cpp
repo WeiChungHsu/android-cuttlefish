@@ -19,7 +19,6 @@
 #include <fcntl.h>
 
 #include <memory>
-#include <mutex>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -27,11 +26,9 @@
 
 #include <android-base/strings.h>
 
-#include "common/libs/fs/shared_buf.h"
 #include "common/libs/fs/shared_fd.h"
 #include "common/libs/utils/result.h"
 #include "cuttlefish/host/commands/cvd/cvd_server.pb.h"
-#include "host/commands/cvd/command_sequence.h"
 #include "host/commands/cvd/request_context.h"
 #include "host/commands/cvd/server_command/utils.h"
 #include "host/commands/cvd/types.h"
@@ -72,6 +69,8 @@ Example usage:
   cvd help <command> - displays more detailed help for the specific command
 )";
 
+constexpr char kIgnorableHandlerCommand[] = "experimental";
+
 }  // namespace
 
 class CvdHelpHandler : public CvdServerHandler {
@@ -88,14 +87,16 @@ class CvdHelpHandler : public CvdServerHandler {
   Result<cvd::Response> Handle(const RequestWithStdio& request) override {
     CF_EXPECT(CanHandle(request));
 
-    std::string output;
     auto args = ParseInvocation(request.Message()).arguments;
     if (args.empty()) {
-      output = CF_EXPECT(TopLevelHelp());
+      request.Out() << CF_EXPECT(TopLevelHelp());
     } else {
-      output = CF_EXPECT(SubCommandHelp(args));
+      request.Out() << CF_EXPECT(SubCommandHelp(args));
     }
-    auto response = CF_EXPECT(WriteToFd(request.Out(), output));
+
+    cvd::Response response;
+    response.mutable_command_response();  // Sets oneof member
+    response.mutable_status()->set_code(cvd::Status::OK);
     return response;
   }
 
@@ -115,9 +116,7 @@ class CvdHelpHandler : public CvdServerHandler {
     auto& lookup_cmd = *lookup.mutable_command_request();
     lookup_cmd.add_args("cvd");
     lookup_cmd.add_args(arg);
-    auto dev_null = SharedFD::Open("/dev/null", O_RDWR);
-    CF_EXPECT(dev_null->IsOpen(), dev_null->StrError());
-    return RequestWithStdio(lookup, {dev_null, dev_null, dev_null});
+    return RequestWithStdio::NullIo(std::move(lookup));
   }
 
   Result<std::string> TopLevelHelp() {
@@ -127,7 +126,7 @@ class CvdHelpHandler : public CvdServerHandler {
       std::string command_list = android::base::Join(handler->CmdList(), ", ");
       // exclude commands without any command list values as not intended for
       // use by users or sub-subcommands
-      if (!command_list.empty()) {
+      if (!command_list.empty() && command_list != kIgnorableHandlerCommand) {
         help_message << "\t" << command_list << " - ";
         help_message << CF_EXPECT(handler->SummaryHelp()) << std::endl
                      << std::endl;
